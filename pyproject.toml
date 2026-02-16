@@ -1,0 +1,10 @@
+[project]
+name = "chytorch-rxnmap"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "chytorch>=1.65",
+    "pytorch-lightning>=2.6.1",
+]

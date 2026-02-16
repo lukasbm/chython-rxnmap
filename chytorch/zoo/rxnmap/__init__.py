@@ -17,32 +17,78 @@
 #  along with this program; if not, see <https://www.gnu.org/licenses/>.
 #
 from functools import partial
-from pkg_resources import resource_stream
+from importlib.resources import files
+from math import cos, pi
+from typing import Callable, Iterator
+
 from pytorch_lightning import LightningModule
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from torch import rand
 from torch.nn import LazyLinear, Parameter
 from torch.nn.functional import cross_entropy
 from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
-from typing import Callable, Iterator
-from ...nn import ReactionEncoder
-from ...optim.lr_scheduler import WarmUpCosine
-from ...utils.data import ReactionDataset, collate_reactions
+
+from chytorch.nn import ReactionEncoder
+from chytorch.utils.data import ReactionDataset, collate_reactions
+
+
+class WarmUpCosine(_LRScheduler):
+    """Learning rate scheduler with warmup followed by cosine annealing."""
+
+    def __init__(
+        self,
+        optimizer: Optimizer,
+        warmup: int = 10000,
+        period: int = 500000,
+        decrease_coef: float = 0.01,
+        last_epoch: int = -1,
+    ):
+        self.warmup = warmup
+        self.period = period
+        self.decrease_coef = decrease_coef
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        current_step = self.last_epoch
+        if current_step < self.warmup:
+            # Linear warmup
+            return [base_lr * (current_step / self.warmup) for base_lr in self.base_lrs]
+        else:
+            # Cosine annealing
+            progress = (current_step - self.warmup) / (self.period - self.warmup)
+            progress = min(progress, 1.0)
+            return [
+                base_lr
+                * (
+                    self.decrease_coef
+                    + (1 - self.decrease_coef) * (1 + cos(pi * progress)) / 2
+                )
+                for base_lr in self.base_lrs
+            ]
 
 
 class Model(LightningModule):
-    def __init__(self, *, masking_rate=.15,
-                 lr_scheduler: Callable[[Optimizer], _LRScheduler] = None,
-                 optimizer: Callable[[Iterator[Parameter]], Optimizer] = None, **kwargs):
+    def __init__(
+        self,
+        *,
+        masking_rate=0.15,
+        lr_scheduler: Callable[[Optimizer], _LRScheduler] = None,
+        optimizer: Callable[[Iterator[Parameter]], Optimizer] = None,
+        **kwargs,
+    ):
         super().__init__()
         self.encoder = ReactionEncoder(**kwargs)
         self.mlma = LazyLinear(118)
-        self.mlmn = LazyLinear(self.encoder.molecule_encoder.centrality_encoder.num_embeddings - 2)
+        self.mlmn = LazyLinear(
+            self.encoder.molecule_encoder.centrality_encoder.num_embeddings - 2
+        )
 
         if lr_scheduler is None:
-            lr_scheduler = partial(WarmUpCosine, decrease_coef=.01, warmup=int(1e4), period=int(5e5))
+            lr_scheduler = partial(
+                WarmUpCosine, decrease_coef=0.01, warmup=int(1e4), period=int(5e5)
+            )
         if optimizer is None:
             optimizer = partial(AdamW, lr=1e-4)
 
@@ -53,7 +99,10 @@ class Model(LightningModule):
 
     @classmethod
     def pretrained(cls, **kwargs):
-        model = cls.load_from_checkpoint(resource_stream(__package__, 'weights.pt'), map_location='cpu', **kwargs)
+        weights_path = files(__package__).joinpath("weights.pt")
+        model = cls.load_from_checkpoint(
+            str(weights_path), map_location="cpu", **kwargs
+        )
         model.eval()
         return model
 
@@ -63,7 +112,9 @@ class Model(LightningModule):
 
         :param reactions: chython packed reactions list.
         """
-        ds = ReactionDataset(reactions, distance_cutoff=self.encoder.max_distance, unpack=True)
+        ds = ReactionDataset(
+            reactions, distance_cutoff=self.encoder.max_distance, unpack=True
+        )
         return DataLoader(ds, collate_fn=collate_reactions, **kwargs)
 
     def forward(self, batch, *, mapping_task=False):
@@ -83,19 +134,23 @@ class Model(LightningModule):
 
         l1 = cross_entropy(atoms, a[m].long() - 3)
         l2 = cross_entropy(neighbors, n[m].long() - 2)
-        self.log('trn_loss_mlm_a', l1.item(), sync_dist=True)
-        self.log('trn_loss_mlm_n', l2.item(), sync_dist=True)
-        self.log('trn_loss_tot', l1.item() + l2.item(), sync_dist=True)
+        self.log("trn_loss_mlm_a", l1.item(), sync_dist=True)
+        self.log("trn_loss_mlm_n", l2.item(), sync_dist=True)
+        self.log("trn_loss_tot", l1.item() + l2.item(), sync_dist=True)
         return l1 + l2
 
     def configure_callbacks(self):
-        return [ModelCheckpoint(save_weights_only=True, save_last=True, every_n_train_steps=10000),
-                LearningRateMonitor(logging_interval='step')]
+        return [
+            ModelCheckpoint(
+                save_weights_only=True, save_last=True, every_n_train_steps=10000
+            ),
+            LearningRateMonitor(logging_interval="step"),
+        ]
 
     def configure_optimizers(self):
         o = self.optimizer(self.parameters())
         s = self.lr_scheduler(o)
-        return [o], [{'scheduler': s, 'interval': 'step', 'name': 'lr_scheduler'}]
+        return [o], [{"scheduler": s, "interval": "step", "name": "lr_scheduler"}]
 
 
-__all__ = ['Model']
+__all__ = ["Model"]
