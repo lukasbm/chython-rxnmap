@@ -35,12 +35,16 @@ Pretrained model
 
 **To prepare data-loader use:**
 
-    from chython import SMILESRead
+    import csv
+    from chython import smiles
 
     data = []
-    for r in SMILESRead('data.smi'):
-        r.canonicalize()  # fix aromaticity and functional groups
-        data.append(r.pack())  # store in compressed format
+    with open('data.csv', newline='') as f:
+        for row in csv.reader(f):
+            for rxn in row:
+                r = smiles(rxn.strip())
+                r.canonicalize()  # fix aromaticity and functional groups
+                data.append(r.pack())  # store in compressed format
 
     dl = model.prepare_dataloader(data, batch_size=20)
 
