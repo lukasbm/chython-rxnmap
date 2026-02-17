@@ -10,6 +10,7 @@ import fire
 import torch
 from chython import smiles
 from pytorch_lightning import Trainer, seed_everything
+from pytorch_lightning.callbacks import TQDMProgressBar
 from pytorch_lightning.loggers import CSVLogger
 from torch.nn.functional import cross_entropy, normalize
 from torch.optim import AdamW
@@ -275,6 +276,8 @@ def run_training_experiment(
         except (ImportError, ModuleNotFoundError) as e:
             print(f"Warning: aim logging unavailable ({e}), using CSV logger only")
 
+    progress_bar = TQDMProgressBar(refresh_rate=10)
+
     trainer = Trainer(
         accelerator="cpu",
         devices=1,
@@ -283,7 +286,8 @@ def run_training_experiment(
         logger=loggers,
         log_every_n_steps=1,
         num_sanity_val_steps=0,
-        enable_progress_bar=False,
+        enable_progress_bar=True,
+        callbacks=[progress_bar],
     )
     model.train()
     trainer.fit(model, train_dataloaders=train_loader)
