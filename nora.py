@@ -140,11 +140,11 @@ def _greedy_assignment(similarity: torch.Tensor) -> tuple[list[int], list[float]
     return assigned, scores
 
 
-def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 3) -> dict[str, float]:
+def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 3, batch_size: int = 64) -> dict[str, float]:
     """
-    Evaluate mapping metrics on dataset using batched processing.
+    Evaluate mapping metrics on dataset using PyTorch dataloader for batched inference.
     
-    Processes all reactions in batches instead of one-by-one for ~10-100x speedup.
+    Uses standard PyTorch batching for efficient GPU utilization.
     """
     model.eval()
 
@@ -159,48 +159,57 @@ def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 
     score_count = 0
 
     with torch.no_grad():
-        # Process in batches for efficiency instead of one-by-one
-        dataloader = model.prepare_dataloader(dataset.packed, batch_size=64, shuffle=False)
-
-        batch_idx = 0
+        # Use PyTorch dataloader for efficient batching
+        dataloader = model.prepare_dataloader(dataset.packed, batch_size=batch_size, shuffle=False)
+        
+        # Track which reaction we're on (since dataloader batches are independent of dataset.reactions)
+        reaction_idx = 0
+        
         for batch in dataloader:
             atoms, neighbors, distances, roles = batch
-            embeddings = model(batch)  # Pass full batch tuple
+            embeddings = model(batch)
+            batch_size_actual = atoms.shape[0]
 
-            # Process each reaction in batch
-            for idx in range(atoms.shape[0]):
-                if batch_idx >= len(dataset.reactions):
+            # Process each reaction in the batch
+            for i in range(batch_size_actual):
+                if reaction_idx >= len(dataset.reactions):
                     break
+                
+                reaction = dataset.reactions[reaction_idx]
+                reaction_idx += 1
+                
+                atom_tokens = atoms[i]
+                role_tokens = roles[i]
+                embedding = embeddings[i]
 
-                reaction = dataset.reactions[batch_idx]
-                atom_tokens = atoms[idx]
-                role_tokens = roles[idx]
-                embedding = embeddings[idx]
-
+                # Extract reactant and product token indices
                 reactant_token_idx = torch.where(role_tokens == 2)[0]
                 product_token_idx = torch.where(role_tokens == 3)[0]
                 if reactant_token_idx.numel() == 0 or product_token_idx.numel() == 0:
-                    batch_idx += 1
                     continue
 
+                # Get ground truth mappings from reaction
                 reactant_maps = [n for m in reaction.reactants for n in m]
                 product_maps = [n for m in reaction.products for n in m]
                 if len(reactant_maps) != reactant_token_idx.numel() or len(product_maps) != product_token_idx.numel():
-                    batch_idx += 1
                     continue
 
+                # Compute similarity matrix
                 reactant_map_to_local = {map_num: idx for idx, map_num in enumerate(reactant_maps)}
                 reactant_embeddings = normalize(embedding[reactant_token_idx], dim=-1)
                 product_embeddings = normalize(embedding[product_token_idx], dim=-1)
                 similarity = product_embeddings @ reactant_embeddings.T
 
+                # Mask out different atom types
                 reactant_types = atom_tokens[reactant_token_idx]
                 product_types = atom_tokens[product_token_idx]
                 same_atom_type = product_types[:, None] == reactant_types[None, :]
                 similarity = similarity.masked_fill(~same_atom_type, -1e9)
 
+                # Greedy assignment
                 assigned, assigned_scores = _greedy_assignment(similarity)
 
+                # Evaluate metrics for this reaction
                 has_mappable_atom = False
                 reaction_is_exact = True
                 for product_local_idx, product_map_num in enumerate(product_maps):
@@ -210,6 +219,7 @@ def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 
                     has_mappable_atom = True
                     mappable_atoms += 1
 
+                    # Top-k accuracy
                     ranked_indices = torch.topk(
                         similarity[product_local_idx],
                         k=min(top_k, similarity.shape[1]),
@@ -219,6 +229,7 @@ def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 
                     if reactant_local_idx in ranked_indices:
                         topk_hits += 1
 
+                    # Assignment accuracy
                     predicted_local_idx = assigned[product_local_idx]
                     if predicted_local_idx != -1:
                         assigned_atoms += 1
@@ -233,8 +244,6 @@ def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 
                     mapped_reactions += 1
                     if reaction_is_exact:
                         exact_matches += 1
-
-                batch_idx += 1
 
     if mappable_atoms == 0:
         return {
