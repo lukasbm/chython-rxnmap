@@ -6,7 +6,6 @@ import fire
 import optuna
 
 from nora import (
-    ExperimentConfig,
     Model,
     evaluate_model,
     load_reaction_dataset,
@@ -17,13 +16,14 @@ from nora import (
 
 
 def main(
-    train: str = "train_ringreactions.csv",
-    test: str = "test_ringreactions.csv",
-    n_trials: int = 5,
-    max_epochs: int = 1,
-    batch_size: int = 16,
-    seed: int = 42,
-    study_name: str = "rxnmap_optuna",
+        train: str = "train_ringreactions.csv",
+        test: str = "test_ringreactions.csv",
+        n_trials: int = 5,
+        max_epochs: int = 1,
+        batch_size: int = 16,
+        seed: int = 42,
+        study_name: str = "rxnmap_optuna",
+        use_aim: bool = False,
 ):
     train_dataset = load_reaction_dataset(Path(train), name="train")
     test_dataset = load_reaction_dataset(Path(test), name="test")
@@ -39,23 +39,37 @@ def main(
     print_metrics("pretrained_baseline_on_test", baseline_metrics)
 
     def objective(trial: optuna.Trial) -> float:
-        config = ExperimentConfig(
-            batch_size=batch_size,
-            max_epochs=max_epochs,
-            seed=seed + trial.number,
-            masking_rate=trial.suggest_float("masking_rate", 0.05, 0.35),
-            learning_rate=trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True),
-            dropout=trial.suggest_float("dropout", 0.0, 0.3),
-        )
+        masking_rate = trial.suggest_float("masking_rate", 0.05, 0.35)
+        learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
+        dropout = trial.suggest_float("dropout", 0.0, 0.3)
+
         metrics = run_scratch_experiment(
             train_dataset,
             test_dataset,
-            config,
-            run_name=study_name,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            seed=seed + trial.number,
+            masking_rate=masking_rate,
+            learning_rate=learning_rate,
+            dropout=dropout,
+            run_name=f"{study_name}_trial_{trial.number}",
+            use_aim=use_aim,
+            aim_experiment=study_name,
         )
+
         trial.set_user_attr("mlm_loss_total", metrics["mlm_loss_total"])
+        trial.set_user_attr("mlm_loss_atom", metrics["mlm_loss_atom"])
+        trial.set_user_attr("mlm_loss_neighbor", metrics["mlm_loss_neighbor"])
+        trial.set_user_attr("mlm_atom_accuracy", metrics["mlm_atom_accuracy"])
+        trial.set_user_attr("mlm_neighbor_accuracy", metrics["mlm_neighbor_accuracy"])
+        trial.set_user_attr("mlm_perplexity", metrics["mlm_perplexity"])
+        trial.set_user_attr("mapping_atom_accuracy", metrics["mapping_atom_accuracy"])
         trial.set_user_attr("mapping_exact_match", metrics["mapping_exact_match"])
+        trial.set_user_attr("mapping_top1", metrics["mapping_top1"])
         trial.set_user_attr("mapping_topk", metrics["mapping_topk"])
+        trial.set_user_attr("mapping_assignment_coverage", metrics["mapping_assignment_coverage"])
+        trial.set_user_attr("mapping_mean_similarity", metrics["mapping_mean_similarity"])
+
         return float(metrics["mapping_atom_accuracy"])
 
     study = optuna.create_study(direction="maximize", study_name=study_name)
@@ -67,6 +81,8 @@ def main(
     print(f"best_value(mapping_atom_accuracy): {study.best_value:.6f}")
     print(f"best_params: {study.best_trial.params}")
     print(f"best_trial_mlm_loss_total: {study.best_trial.user_attrs.get('mlm_loss_total'):.6f}")
+    print(f"best_trial_mlm_atom_accuracy: {study.best_trial.user_attrs.get('mlm_atom_accuracy'):.6f}")
+    print(f"best_trial_mlm_neighbor_accuracy: {study.best_trial.user_attrs.get('mlm_neighbor_accuracy'):.6f}")
     print(
         f"best_trial_mapping_exact_match: {study.best_trial.user_attrs.get('mapping_exact_match'):.6f}"
     )

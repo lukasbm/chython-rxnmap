@@ -27,17 +27,6 @@ class DatasetBundle:
     failed: int
 
 
-@dataclass
-class ExperimentConfig:
-    batch_size: int = 16
-    max_epochs: int = 1
-    seed: int = 42
-    masking_rate: float = 0.15
-    learning_rate: float = 1e-4
-    finetune_learning_rate: float = 1e-5
-    dropout: float = 0.1
-
-
 def iter_first_column_reactions(csv_path: Path):
     with csv_path.open("r", newline="") as f:
         for row in csv.reader(f):
@@ -63,18 +52,18 @@ def load_reaction_dataset(csv_path: Path, name: str) -> DatasetBundle:
     return DatasetBundle(name=name, path=csv_path, reactions=reactions, packed=packed, total=total, failed=failed)
 
 
-def build_training_model(config: ExperimentConfig) -> Model:
+def build_training_model(masking_rate: float, learning_rate: float, dropout: float) -> Model:
     return Model(
-        masking_rate=config.masking_rate,
-        optimizer=partial(AdamW, lr=config.learning_rate),
-        dropout=config.dropout,
+        masking_rate=masking_rate,
+        optimizer=partial(AdamW, lr=learning_rate),
+        dropout=dropout,
     )
 
 
-def build_finetune_model(config: ExperimentConfig) -> Model:
+def build_finetune_model(masking_rate: float, finetune_learning_rate: float) -> Model:
     model = Model.pretrained()
-    model.masking_rate = config.masking_rate
-    model.optimizer = partial(AdamW, lr=config.finetune_learning_rate)
+    model.masking_rate = masking_rate
+    model.optimizer = partial(AdamW, lr=finetune_learning_rate)
     return model
 
 
@@ -260,21 +249,38 @@ def run_training_experiment(
         model: Model,
         train_dataset: DatasetBundle,
         test_dataset: DatasetBundle,
-        config: ExperimentConfig,
+        batch_size: int,
+        max_epochs: int,
+        seed: int,
         run_name: str = "rxnmap_training",
+        use_aim: bool = False,
+        aim_experiment: str | None = None,
 ) -> dict[str, float | str]:
-    seed_everything(config.seed, workers=True)
+    seed_everything(seed, workers=True)
     train_loader = model.prepare_dataloader(
-        train_dataset.packed, batch_size=config.batch_size, shuffle=True
+        train_dataset.packed, batch_size=batch_size, shuffle=True
     )
 
-    logger = CSVLogger("lightning_logs", name=run_name)
+    loggers = [CSVLogger("lightning_logs", name=run_name)]
+    if use_aim:
+        try:
+            from aim.pytorch_lightning import AimLogger
+            aim_logger = AimLogger(
+                experiment=aim_experiment or run_name,
+                train_metric_prefix='train/',
+                val_metric_prefix='val/',
+                test_metric_prefix='test/',
+            )
+            loggers.append(aim_logger)
+        except (ImportError, ModuleNotFoundError) as e:
+            print(f"Warning: aim logging unavailable ({e}), using CSV logger only")
+
     trainer = Trainer(
         accelerator="cpu",
         devices=1,
         precision="32",
-        max_epochs=config.max_epochs,
-        logger=logger,
+        max_epochs=max_epochs,
+        logger=loggers,
         log_every_n_steps=1,
         num_sanity_val_steps=0,
         enable_progress_bar=False,
@@ -282,11 +288,13 @@ def run_training_experiment(
     model.train()
     trainer.fit(model, train_dataloaders=train_loader)
 
-    test_metrics = evaluate_model(model, test_dataset, batch_size=config.batch_size, mask_seed=config.seed)
-    last_checkpoint = Path(logger.log_dir) / "checkpoints" / "last.ckpt"
+    test_metrics = evaluate_model(model, test_dataset, batch_size=batch_size, mask_seed=seed)
+
+    csv_logger = loggers[0]
+    last_checkpoint = Path(csv_logger.log_dir) / "checkpoints" / "last.ckpt"
     return {
         **test_metrics,
-        "log_dir": logger.log_dir,
+        "log_dir": csv_logger.log_dir,
         "last_checkpoint": str(last_checkpoint) if last_checkpoint.exists() else "",
     }
 
@@ -294,30 +302,53 @@ def run_training_experiment(
 def run_scratch_experiment(
         train_dataset: DatasetBundle,
         test_dataset: DatasetBundle,
-        config: ExperimentConfig,
+        batch_size: int,
+        max_epochs: int,
+        seed: int,
+        masking_rate: float,
+        learning_rate: float,
+        dropout: float,
         run_name: str = "rxnmap_training",
+        use_aim: bool = False,
+        aim_experiment: str | None = None,
 ) -> dict[str, float | str]:
+    model = build_training_model(masking_rate, learning_rate, dropout)
     return run_training_experiment(
-        build_training_model(config),
+        model,
         train_dataset=train_dataset,
         test_dataset=test_dataset,
-        config=config,
+        batch_size=batch_size,
+        max_epochs=max_epochs,
+        seed=seed,
         run_name=run_name,
+        use_aim=use_aim,
+        aim_experiment=aim_experiment,
     )
 
 
 def run_finetune_experiment(
         train_dataset: DatasetBundle,
         test_dataset: DatasetBundle,
-        config: ExperimentConfig,
+        batch_size: int,
+        max_epochs: int,
+        seed: int,
+        masking_rate: float,
+        finetune_learning_rate: float,
         run_name: str = "rxnmap_finetune",
+        use_aim: bool = False,
+        aim_experiment: str | None = None,
 ) -> dict[str, float | str]:
+    model = build_finetune_model(masking_rate, finetune_learning_rate)
     return run_training_experiment(
-        build_finetune_model(config),
+        model,
         train_dataset=train_dataset,
         test_dataset=test_dataset,
-        config=config,
+        batch_size=batch_size,
+        max_epochs=max_epochs,
+        seed=seed,
         run_name=run_name,
+        use_aim=use_aim,
+        aim_experiment=aim_experiment,
     )
 
 
@@ -361,6 +392,8 @@ def main(
         learning_rate: float = 1e-4,
         finetune_learning_rate: float = 1e-5,
         dropout: float = 0.1,
+        use_aim: bool = False,
+        aim_experiment: str | None = None,
 ):
     train_dataset = load_reaction_dataset(Path(train), name="train")
     test_dataset = load_reaction_dataset(Path(test), name="test")
@@ -377,21 +410,34 @@ def main(
     )
     print_metrics("pretrained_baseline_on_test", baseline_metrics)
 
-    config = ExperimentConfig(
+    print(
+        f"Training config: epochs={max_epochs}, batch_size={batch_size}, masking_rate={masking_rate}, lr={learning_rate}, finetune_lr={finetune_learning_rate}, dropout={dropout}, use_aim={use_aim}"
+    )
+    scratch_metrics = run_scratch_experiment(
+        train_dataset,
+        test_dataset,
         batch_size=batch_size,
         max_epochs=max_epochs,
         seed=seed,
         masking_rate=masking_rate,
         learning_rate=learning_rate,
-        finetune_learning_rate=finetune_learning_rate,
         dropout=dropout,
+        use_aim=use_aim,
+        aim_experiment=aim_experiment,
     )
-    print(
-        f"Training config: epochs={config.max_epochs}, batch_size={config.batch_size}, masking_rate={config.masking_rate}, lr={config.learning_rate}, finetune_lr={config.finetune_learning_rate}, dropout={config.dropout}"
-    )
-    scratch_metrics = run_scratch_experiment(train_dataset, test_dataset, config)
     print_metrics("scratch_trained_model_on_test", scratch_metrics)
-    finetuned_metrics = run_finetune_experiment(train_dataset, test_dataset, config)
+
+    finetuned_metrics = run_finetune_experiment(
+        train_dataset,
+        test_dataset,
+        batch_size=batch_size,
+        max_epochs=max_epochs,
+        seed=seed,
+        masking_rate=masking_rate,
+        finetune_learning_rate=finetune_learning_rate,
+        use_aim=use_aim,
+        aim_experiment=aim_experiment,
+    )
     print_metrics("finetuned_pretrained_model_on_test", finetuned_metrics)
 
     print("=" * 60)
