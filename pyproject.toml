@@ -15,7 +15,6 @@ dependencies = [
     "pandas>=2.3.3",
     "pandas-stubs~=3.0.0",
     "pytorch-lightning>=2.6.1",
-    "setuptools>=65.0.0",
     "torch>=2.10.0",
     "torch-geometric>=2.7.0",
 ]

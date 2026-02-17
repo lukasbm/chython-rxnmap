@@ -23,7 +23,7 @@ def main(
         batch_size: int = 16,
         seed: int = 42,
         study_name: str = "rxnmap_optuna",
-        use_aim: bool = False,
+        use_aim: bool = True,
 ):
     train_dataset = load_reaction_dataset(Path(train), name="train")
     test_dataset = load_reaction_dataset(Path(test), name="test")
@@ -69,6 +69,24 @@ def main(
         trial.set_user_attr("mapping_topk", metrics["mapping_topk"])
         trial.set_user_attr("mapping_assignment_coverage", metrics["mapping_assignment_coverage"])
         trial.set_user_attr("mapping_mean_similarity", metrics["mapping_mean_similarity"])
+
+        # Print trial results
+        print(f"\n{'=' * 70}")
+        print(f"TRIAL {trial.number} RESULTS")
+        print(f"{'=' * 70}")
+        print(f"Hyperparameters:")
+        print(f"  masking_rate: {masking_rate:.6f}")
+        print(f"  learning_rate: {learning_rate:.6e}")
+        print(f"  dropout: {dropout:.6f}")
+        print(f"Metrics:")
+        print(f"  mlm_loss_total: {metrics['mlm_loss_total']:.6f}")
+        print(f"  mlm_atom_accuracy: {metrics['mlm_atom_accuracy']:.6f}")
+        print(f"  mlm_neighbor_accuracy: {metrics['mlm_neighbor_accuracy']:.6f}")
+        print(f"  mapping_atom_accuracy: {metrics['mapping_atom_accuracy']:.6f}")
+        print(f"  mapping_exact_match: {metrics['mapping_exact_match']:.6f}")
+        print(f"  mapping_top1: {metrics['mapping_top1']:.6f}")
+        print(f"  mapping_topk: {metrics['mapping_topk']:.6f}")
+        print(f"{'=' * 70}\n")
 
         return float(metrics["mapping_atom_accuracy"])
 

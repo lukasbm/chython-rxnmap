@@ -21,6 +21,8 @@ from importlib.resources import files
 from math import cos, pi
 from typing import Callable, Iterator
 
+from chytorch.nn import ReactionEncoder
+from chytorch.utils.data import ReactionDataset, collate_reactions
 from pytorch_lightning import LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from torch import rand
@@ -30,20 +32,17 @@ from torch.optim import AdamW, Optimizer
 from torch.optim.lr_scheduler import _LRScheduler
 from torch.utils.data import DataLoader
 
-from chytorch.nn import ReactionEncoder
-from chytorch.utils.data import ReactionDataset, collate_reactions
-
 
 class WarmUpCosine(_LRScheduler):
     """Learning rate scheduler with warmup followed by cosine annealing."""
 
     def __init__(
-        self,
-        optimizer: Optimizer,
-        warmup: int = 10000,
-        period: int = 500000,
-        decrease_coef: float = 0.01,
-        last_epoch: int = -1,
+            self,
+            optimizer: Optimizer,
+            warmup: int = 10000,
+            period: int = 500000,
+            decrease_coef: float = 0.01,
+            last_epoch: int = -1,
     ):
         self.warmup = warmup
         self.period = period
@@ -62,8 +61,8 @@ class WarmUpCosine(_LRScheduler):
             return [
                 base_lr
                 * (
-                    self.decrease_coef
-                    + (1 - self.decrease_coef) * (1 + cos(pi * progress)) / 2
+                        self.decrease_coef
+                        + (1 - self.decrease_coef) * (1 + cos(pi * progress)) / 2
                 )
                 for base_lr in self.base_lrs
             ]
@@ -71,12 +70,12 @@ class WarmUpCosine(_LRScheduler):
 
 class Model(LightningModule):
     def __init__(
-        self,
-        *,
-        masking_rate=0.15,
-        lr_scheduler: Callable[[Optimizer], _LRScheduler] = None,
-        optimizer: Callable[[Iterator[Parameter]], Optimizer] = None,
-        **kwargs,
+            self,
+            *,
+            masking_rate=0.15,
+            lr_scheduler: Callable[[Optimizer], _LRScheduler] = None,
+            optimizer: Callable[[Iterator[Parameter]], Optimizer] = None,
+            **kwargs,
     ):
         super().__init__()
         self.encoder = ReactionEncoder(**kwargs)

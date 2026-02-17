@@ -141,6 +141,11 @@ def _greedy_assignment(similarity: torch.Tensor) -> tuple[list[int], list[float]
 
 
 def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 3) -> dict[str, float]:
+    """
+    Evaluate mapping metrics on dataset using batched processing.
+    
+    Processes all reactions in batches instead of one-by-one for ~10-100x speedup.
+    """
     model.eval()
 
     mapped_reactions = 0
@@ -154,69 +159,82 @@ def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 
     score_count = 0
 
     with torch.no_grad():
-        for reaction, packed_reaction in zip(dataset.reactions, dataset.packed):
-            batch = next(
-                iter(model.prepare_dataloader([packed_reaction], batch_size=1, shuffle=False))
-            )
-            atoms, _, _, roles = batch
-            embedding = model(batch)[0]
-            atom_tokens = atoms[0]
-            role_tokens = roles[0]
+        # Process in batches for efficiency instead of one-by-one
+        dataloader = model.prepare_dataloader(dataset.packed, batch_size=64, shuffle=False)
 
-            reactant_token_idx = torch.where(role_tokens == 2)[0]
-            product_token_idx = torch.where(role_tokens == 3)[0]
-            if reactant_token_idx.numel() == 0 or product_token_idx.numel() == 0:
-                continue
+        batch_idx = 0
+        for batch in dataloader:
+            atoms, neighbors, distances, roles = batch
+            embeddings = model(batch)  # Pass full batch tuple
 
-            reactant_maps = [n for m in reaction.reactants for n in m]
-            product_maps = [n for m in reaction.products for n in m]
-            if len(reactant_maps) != reactant_token_idx.numel() or len(product_maps) != product_token_idx.numel():
-                continue
+            # Process each reaction in batch
+            for idx in range(atoms.shape[0]):
+                if batch_idx >= len(dataset.reactions):
+                    break
 
-            reactant_map_to_local = {map_num: idx for idx, map_num in enumerate(reactant_maps)}
-            reactant_embeddings = normalize(embedding[reactant_token_idx], dim=-1)
-            product_embeddings = normalize(embedding[product_token_idx], dim=-1)
-            similarity = product_embeddings @ reactant_embeddings.T
+                reaction = dataset.reactions[batch_idx]
+                atom_tokens = atoms[idx]
+                role_tokens = roles[idx]
+                embedding = embeddings[idx]
 
-            reactant_types = atom_tokens[reactant_token_idx]
-            product_types = atom_tokens[product_token_idx]
-            same_atom_type = product_types[:, None] == reactant_types[None, :]
-            similarity = similarity.masked_fill(~same_atom_type, -1e9)
-
-            assigned, assigned_scores = _greedy_assignment(similarity)
-
-            has_mappable_atom = False
-            reaction_is_exact = True
-            for product_local_idx, product_map_num in enumerate(product_maps):
-                reactant_local_idx = reactant_map_to_local.get(product_map_num)
-                if reactant_local_idx is None:
+                reactant_token_idx = torch.where(role_tokens == 2)[0]
+                product_token_idx = torch.where(role_tokens == 3)[0]
+                if reactant_token_idx.numel() == 0 or product_token_idx.numel() == 0:
+                    batch_idx += 1
                     continue
-                has_mappable_atom = True
-                mappable_atoms += 1
 
-                ranked_indices = torch.topk(
-                    similarity[product_local_idx],
-                    k=min(top_k, similarity.shape[1]),
-                ).indices.tolist()
-                if ranked_indices and ranked_indices[0] == reactant_local_idx:
-                    top1_hits += 1
-                if reactant_local_idx in ranked_indices:
-                    topk_hits += 1
+                reactant_maps = [n for m in reaction.reactants for n in m]
+                product_maps = [n for m in reaction.products for n in m]
+                if len(reactant_maps) != reactant_token_idx.numel() or len(product_maps) != product_token_idx.numel():
+                    batch_idx += 1
+                    continue
 
-                predicted_local_idx = assigned[product_local_idx]
-                if predicted_local_idx != -1:
-                    assigned_atoms += 1
-                    score_sum += assigned_scores[product_local_idx]
-                    score_count += 1
-                if predicted_local_idx == reactant_local_idx:
-                    correct_atoms += 1
-                else:
-                    reaction_is_exact = False
+                reactant_map_to_local = {map_num: idx for idx, map_num in enumerate(reactant_maps)}
+                reactant_embeddings = normalize(embedding[reactant_token_idx], dim=-1)
+                product_embeddings = normalize(embedding[product_token_idx], dim=-1)
+                similarity = product_embeddings @ reactant_embeddings.T
 
-            if has_mappable_atom:
-                mapped_reactions += 1
-                if reaction_is_exact:
-                    exact_matches += 1
+                reactant_types = atom_tokens[reactant_token_idx]
+                product_types = atom_tokens[product_token_idx]
+                same_atom_type = product_types[:, None] == reactant_types[None, :]
+                similarity = similarity.masked_fill(~same_atom_type, -1e9)
+
+                assigned, assigned_scores = _greedy_assignment(similarity)
+
+                has_mappable_atom = False
+                reaction_is_exact = True
+                for product_local_idx, product_map_num in enumerate(product_maps):
+                    reactant_local_idx = reactant_map_to_local.get(product_map_num)
+                    if reactant_local_idx is None:
+                        continue
+                    has_mappable_atom = True
+                    mappable_atoms += 1
+
+                    ranked_indices = torch.topk(
+                        similarity[product_local_idx],
+                        k=min(top_k, similarity.shape[1]),
+                    ).indices.tolist()
+                    if ranked_indices and ranked_indices[0] == reactant_local_idx:
+                        top1_hits += 1
+                    if reactant_local_idx in ranked_indices:
+                        topk_hits += 1
+
+                    predicted_local_idx = assigned[product_local_idx]
+                    if predicted_local_idx != -1:
+                        assigned_atoms += 1
+                        score_sum += assigned_scores[product_local_idx]
+                        score_count += 1
+                    if predicted_local_idx == reactant_local_idx:
+                        correct_atoms += 1
+                    else:
+                        reaction_is_exact = False
+
+                if has_mappable_atom:
+                    mapped_reactions += 1
+                    if reaction_is_exact:
+                        exact_matches += 1
+
+                batch_idx += 1
 
     if mappable_atoms == 0:
         return {
@@ -273,18 +291,17 @@ def run_training_experiment(
                 test_metric_prefix='test/',
             )
             loggers.append(aim_logger)
-        except (ImportError, ModuleNotFoundError) as e:
-            print(f"Warning: aim logging unavailable ({e}), using CSV logger only")
+        except Exception as e:
+            print(f"Warning: aim logging unavailable ({type(e).__name__}: {e}), using CSV logger only")
 
     progress_bar = TQDMProgressBar(refresh_rate=10)
 
     trainer = Trainer(
-        accelerator="cpu",
         devices=1,
         precision="32",
         max_epochs=max_epochs,
         logger=loggers,
-        log_every_n_steps=1,
+        log_every_n_steps=10,
         num_sanity_val_steps=0,
         enable_progress_bar=True,
         callbacks=[progress_bar],
