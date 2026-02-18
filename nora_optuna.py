@@ -10,16 +10,18 @@ from nora import (
     Model,
     evaluate_model,
     load_reaction_dataset,
-    print_dataset_summary,
     print_metrics,
     run_scratch_experiment,
     run_finetune_experiment,
 )
+from datasets import get_dataset, print_dataset_stats
 
 
 def main(
-        train: str = "train_ringreactions.csv",
-        test: str = "test_ringreactions.csv",
+        dataset: str = "ringreactions",
+        train: str | None = None,
+        test: str | None = None,
+        data_root: str | None = None,
         n_trials: int = 5,
         max_epochs: int | None = None,
         batch_size: int = 16,
@@ -30,10 +32,50 @@ def main(
         use_supervised_loss: bool = False,
         mlm_weight: float = 0.1,
 ):
-    train_dataset = load_reaction_dataset(Path(train), name="train")
-    test_dataset = load_reaction_dataset(Path(test), name="test")
-    print_dataset_summary(train_dataset)
-    print_dataset_summary(test_dataset)
+    """
+    Hyperparameter tuning with Optuna.
+    
+    Args:
+        dataset: Dataset name ("ringreactions", "uspto50k")
+        train: Training split or CSV path (default: auto for dataset)
+        test: Test split or CSV path (default: auto for dataset)
+        data_root: Root directory for datasets (default: current directory)
+        n_trials: Number of Optuna trials
+        max_epochs: Max training epochs (default: 10 for finetune, 100 for scratch)
+        batch_size: Batch size
+        seed: Random seed
+        study_name: Optuna study name
+        use_aim: Enable Aim logging
+        mode: Training mode ("finetune" or "scratch")
+        use_supervised_loss: Use supervised mapping loss (finetune only)
+        mlm_weight: Weight for MLM loss when using supervised loss
+    
+    Examples:
+        # Ring reactions (default)
+        uv run nora_optuna.py --dataset=ringreactions --mode=finetune
+        
+        # USPTO-50k
+        uv run nora_optuna.py --dataset=uspto50k --data_root=data/
+        
+        # Custom CSV files
+        uv run nora_optuna.py --dataset=ringreactions --train=my_train.csv --test=my_test.csv
+    """
+    # Load datasets
+    if dataset.lower() == "ringreactions":
+        # Backward compatibility: support CSV paths
+        train_path = train or "train_ringreactions.csv"
+        test_path = test or "test_ringreactions.csv"
+        train_dataset = get_dataset("ringreactions", split="train", csv_path=train_path, root=data_root)
+        test_dataset = get_dataset("ringreactions", split="test", csv_path=test_path, root=data_root)
+    else:
+        # Use dataset splits
+        train_split = train or "train"
+        test_split = test or "test"
+        train_dataset = get_dataset(dataset, split=train_split, root=data_root)
+        test_dataset = get_dataset(dataset, split=test_split, root=data_root)
+    
+    print_dataset_stats(train_dataset)
+    print_dataset_stats(test_dataset)
 
     if not train_dataset.packed or not test_dataset.packed:
         raise RuntimeError("No valid reactions available after parsing train/test datasets.")

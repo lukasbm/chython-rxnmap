@@ -19,10 +19,12 @@ from torch.utils.data import DataLoader
 
 from chytorch.utils.data import ReactionDataset
 from chytorch.zoo.rxnmap import Model
+from datasets import ReactionDatasetBase, get_dataset, print_dataset_stats
 
 
 @dataclass
 class DatasetBundle:
+    """Deprecated: Use ReactionDatasetBase from datasets.py instead."""
     name: str
     path: Path
     reactions: list[Any]
@@ -32,6 +34,7 @@ class DatasetBundle:
 
 
 def iter_first_column_reactions(csv_path: Path):
+    """Helper for backward compatibility."""
     with csv_path.open("r", newline="") as f:
         for row in csv.reader(f):
             if row and row[0].strip():
@@ -39,6 +42,11 @@ def iter_first_column_reactions(csv_path: Path):
 
 
 def load_reaction_dataset(csv_path: Path, name: str) -> DatasetBundle:
+    """
+    Deprecated: Use get_dataset() from datasets.py instead.
+    
+    Kept for backward compatibility.
+    """
     reactions: list[Any] = []
     packed: list[bytes] = []
     total = 0
@@ -438,7 +446,7 @@ def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 
 
 
 def evaluate_model(
-        model: Model, dataset: DatasetBundle, batch_size: int, mask_seed: int = 0
+        model: Model, dataset: DatasetBundle | ReactionDatasetBase, batch_size: int, mask_seed: int = 0
 ) -> dict[str, float]:
     mlm_metrics = evaluate_mlm_metrics(model, dataset.packed, batch_size=batch_size, mask_seed=mask_seed)
     mapping_metrics = evaluate_mapping_metrics(model, dataset)
@@ -447,8 +455,8 @@ def evaluate_model(
 
 def run_training_experiment(
         model: Model,
-        train_dataset: DatasetBundle,
-        test_dataset: DatasetBundle,
+        train_dataset: DatasetBundle | ReactionDatasetBase,
+        test_dataset: DatasetBundle | ReactionDatasetBase,
         batch_size: int,
         max_epochs: int,
         seed: int,
@@ -515,8 +523,8 @@ def run_training_experiment(
 
 
 def run_scratch_experiment(
-        train_dataset: DatasetBundle,
-        test_dataset: DatasetBundle,
+        train_dataset: DatasetBundle | ReactionDatasetBase,
+        test_dataset: DatasetBundle | ReactionDatasetBase,
         batch_size: int,
         max_epochs: int,
         seed: int,
@@ -542,8 +550,8 @@ def run_scratch_experiment(
 
 
 def run_finetune_experiment(
-        train_dataset: DatasetBundle,
-        test_dataset: DatasetBundle,
+        train_dataset: DatasetBundle | ReactionDatasetBase,
+        test_dataset: DatasetBundle | ReactionDatasetBase,
         batch_size: int,
         max_epochs: int,
         seed: int,
@@ -576,10 +584,16 @@ def run_finetune_experiment(
     )
 
 
-def print_dataset_summary(dataset: DatasetBundle):
-    print(
-        f"{dataset.name}: total={dataset.total}, packed={len(dataset.packed)}, failed={dataset.failed}, source={dataset.path}"
-    )
+def print_dataset_summary(dataset: DatasetBundle | ReactionDatasetBase):
+    """Print dataset summary. Works with both old DatasetBundle and new ReactionDatasetBase."""
+    if isinstance(dataset, DatasetBundle):
+        print(
+            f"{dataset.name}: total={dataset.total}, packed={len(dataset.packed)}, "
+            f"failed={dataset.failed}, source={dataset.path}"
+        )
+    else:
+        # ReactionDatasetBase
+        print_dataset_stats(dataset)
 
 
 def print_metrics(label: str, metrics: dict[str, float | str]):
