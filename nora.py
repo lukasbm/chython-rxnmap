@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import csv
-from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Any
 
 import fire
 import torch
-from chython import smiles
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import TQDMProgressBar
 from pytorch_lightning.loggers import CSVLogger
@@ -20,48 +17,6 @@ from torch.utils.data import DataLoader
 from chytorch.utils.data import ReactionDataset
 from chytorch.zoo.rxnmap import Model
 from datasets import ReactionDatasetBase, get_dataset, print_dataset_stats
-
-
-@dataclass
-class DatasetBundle:
-    """Deprecated: Use ReactionDatasetBase from datasets.py instead."""
-    name: str
-    path: Path
-    reactions: list[Any]
-    packed: list[bytes]
-    total: int
-    failed: int
-
-
-def iter_first_column_reactions(csv_path: Path):
-    """Helper for backward compatibility."""
-    with csv_path.open("r", newline="") as f:
-        for row in csv.reader(f):
-            if row and row[0].strip():
-                yield row[0].strip()
-
-
-def load_reaction_dataset(csv_path: Path, name: str) -> DatasetBundle:
-    """
-    Deprecated: Use get_dataset() from datasets.py instead.
-    
-    Kept for backward compatibility.
-    """
-    reactions: list[Any] = []
-    packed: list[bytes] = []
-    total = 0
-    failed = 0
-    for reaction_smiles in iter_first_column_reactions(csv_path):
-        total += 1
-        try:
-            reaction = smiles(reaction_smiles)
-            reaction.canonicalize()
-            reactions.append(reaction)
-            packed.append(reaction.pack())
-        except Exception as exc:
-            failed += 1
-            print(f"Warning: Could not parse {name} reaction #{total}: {exc}")
-    return DatasetBundle(name=name, path=csv_path, reactions=reactions, packed=packed, total=total, failed=failed)
 
 
 def build_training_model(masking_rate: float, learning_rate: float, dropout: float) -> Model:
@@ -446,7 +401,7 @@ def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 
 
 
 def evaluate_model(
-        model: Model, dataset: DatasetBundle | ReactionDatasetBase, batch_size: int, mask_seed: int = 0
+        model: Model, dataset: ReactionDatasetBase, batch_size: int, mask_seed: int = 0
 ) -> dict[str, float]:
     mlm_metrics = evaluate_mlm_metrics(model, dataset.packed, batch_size=batch_size, mask_seed=mask_seed)
     mapping_metrics = evaluate_mapping_metrics(model, dataset)
@@ -455,8 +410,8 @@ def evaluate_model(
 
 def run_training_experiment(
         model: Model,
-        train_dataset: DatasetBundle | ReactionDatasetBase,
-        test_dataset: DatasetBundle | ReactionDatasetBase,
+        train_dataset: ReactionDatasetBase,
+        test_dataset: ReactionDatasetBase,
         batch_size: int,
         max_epochs: int,
         seed: int,
@@ -466,8 +421,6 @@ def run_training_experiment(
         use_supervised_loss: bool = False,
 ) -> dict[str, float | str]:
     seed_everything(seed, workers=True)
-    
-    # Use supervised dataloader if model supports it
     if use_supervised_loss and isinstance(model, SupervisedMappingModel):
         train_loader = model.prepare_dataloader_supervised(
             train_dataset.reactions, train_dataset.packed, 
@@ -523,8 +476,8 @@ def run_training_experiment(
 
 
 def run_scratch_experiment(
-        train_dataset: DatasetBundle | ReactionDatasetBase,
-        test_dataset: DatasetBundle | ReactionDatasetBase,
+        train_dataset: ReactionDatasetBase,
+        test_dataset: ReactionDatasetBase,
         batch_size: int,
         max_epochs: int,
         seed: int,
@@ -550,8 +503,8 @@ def run_scratch_experiment(
 
 
 def run_finetune_experiment(
-        train_dataset: DatasetBundle | ReactionDatasetBase,
-        test_dataset: DatasetBundle | ReactionDatasetBase,
+        train_dataset: ReactionDatasetBase,
+        test_dataset: ReactionDatasetBase,
         batch_size: int,
         max_epochs: int,
         seed: int,
@@ -584,18 +537,6 @@ def run_finetune_experiment(
     )
 
 
-def print_dataset_summary(dataset: DatasetBundle | ReactionDatasetBase):
-    """Print dataset summary. Works with both old DatasetBundle and new ReactionDatasetBase."""
-    if isinstance(dataset, DatasetBundle):
-        print(
-            f"{dataset.name}: total={dataset.total}, packed={len(dataset.packed)}, "
-            f"failed={dataset.failed}, source={dataset.path}"
-        )
-    else:
-        # ReactionDatasetBase
-        print_dataset_stats(dataset)
-
-
 def print_metrics(label: str, metrics: dict[str, float | str]):
     print(f"{label}:")
     for key in (
@@ -621,8 +562,12 @@ def print_metrics(label: str, metrics: dict[str, float | str]):
 
 
 def main(
-        train: str = "train_ringreactions.csv",
-        test: str = "test_ringreactions.csv",
+        dataset: str = "ringreactions",
+        train_split: str = "train",
+        test_split: str = "test",
+        train_csv: str | None = None,
+        test_csv: str | None = None,
+        data_root: str | None = None,
         batch_size: int = 16,
         max_epochs: int = 1,
         seed: int = 42,
@@ -633,12 +578,39 @@ def main(
         use_aim: bool = False,
         aim_experiment: str | None = None,
 ):
-    train_dataset = load_reaction_dataset(Path(train), name="train")
-    test_dataset = load_reaction_dataset(Path(test), name="test")
-    print_dataset_summary(train_dataset)
-    print_dataset_summary(test_dataset)
+    """
+    Train and evaluate reaction mapping models.
+    
+    Args:
+        dataset: Dataset name ("ringreactions", "uspto50k")
+        train_split: Training split name
+        test_split: Test split name
+        train_csv: Override CSV path for ringreactions training
+        test_csv: Override CSV path for ringreactions test
+        data_root: Root directory for datasets
+        batch_size: Batch size
+        max_epochs: Maximum training epochs
+        seed: Random seed
+        masking_rate: MLM masking rate
+        learning_rate: Learning rate for scratch training
+        finetune_learning_rate: Learning rate for finetuning
+        dropout: Dropout rate
+        use_aim: Enable Aim logging
+        aim_experiment: Aim experiment name
+    """
+    if dataset.lower() == "ringreactions":
+        train_path = train_csv or "train_ringreactions.csv"
+        test_path = test_csv or "test_ringreactions.csv"
+        train_dataset = get_dataset("ringreactions", split=train_split, csv_path=train_path, root=data_root)
+        test_dataset = get_dataset("ringreactions", split=test_split, csv_path=test_path, root=data_root)
+    else:
+        train_dataset = get_dataset(dataset, split=train_split, root=data_root)
+        test_dataset = get_dataset(dataset, split=test_split, root=data_root)
+    
+    print_dataset_stats(train_dataset)
+    print_dataset_stats(test_dataset)
 
-    if not train_dataset.packed or not test_dataset.packed:
+    if len(train_dataset.packed) == 0 or len(test_dataset.packed) == 0:
         raise RuntimeError("No valid reactions available after parsing train/test datasets.")
 
     seed_everything(seed, workers=True)

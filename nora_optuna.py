@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Literal
 
 import fire
@@ -9,7 +8,6 @@ import optuna
 from nora import (
     Model,
     evaluate_model,
-    load_reaction_dataset,
     print_metrics,
     run_scratch_experiment,
     run_finetune_experiment,
@@ -37,9 +35,9 @@ def main(
     
     Args:
         dataset: Dataset name ("ringreactions", "uspto50k")
-        train: Training split or CSV path (default: auto for dataset)
-        test: Test split or CSV path (default: auto for dataset)
-        data_root: Root directory for datasets (default: current directory)
+        train: Training split name or CSV path for ringreactions
+        test: Test split name or CSV path for ringreactions
+        data_root: Root directory for datasets
         n_trials: Number of Optuna trials
         max_epochs: Max training epochs (default: 10 for finetune, 100 for scratch)
         batch_size: Batch size
@@ -59,16 +57,16 @@ def main(
         
         # Custom CSV files
         uv run nora_optuna.py --dataset=ringreactions --train=my_train.csv --test=my_test.csv
+        
+        # Supervised mapping loss
+        uv run nora_optuna.py --dataset=ringreactions --use_supervised_loss=True
     """
-    # Load datasets
     if dataset.lower() == "ringreactions":
-        # Backward compatibility: support CSV paths
         train_path = train or "train_ringreactions.csv"
         test_path = test or "test_ringreactions.csv"
         train_dataset = get_dataset("ringreactions", split="train", csv_path=train_path, root=data_root)
         test_dataset = get_dataset("ringreactions", split="test", csv_path=test_path, root=data_root)
     else:
-        # Use dataset splits
         train_split = train or "train"
         test_split = test or "test"
         train_dataset = get_dataset(dataset, split=train_split, root=data_root)
@@ -77,7 +75,7 @@ def main(
     print_dataset_stats(train_dataset)
     print_dataset_stats(test_dataset)
 
-    if not train_dataset.packed or not test_dataset.packed:
+    if len(train_dataset.packed) == 0 or len(test_dataset.packed) == 0:
         raise RuntimeError("No valid reactions available after parsing train/test datasets.")
 
     print(f"\n{'=' * 70}")

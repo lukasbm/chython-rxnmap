@@ -9,10 +9,9 @@ from pytorch_lightning import seed_everything
 from nora import (
     Model,
     evaluate_model,
-    load_reaction_dataset,
-    print_dataset_summary,
     print_metrics,
 )
+from datasets import get_dataset, print_dataset_stats
 
 
 def load_model_from_checkpoint(checkpoint_path: str | None, model_type: str = "pretrained") -> Model:
@@ -41,7 +40,10 @@ def load_model_from_checkpoint(checkpoint_path: str | None, model_type: str = "p
 
 def evaluate_checkpoint(
         checkpoint_path: str | None,
-        dataset: str,
+        dataset_name: str = "ringreactions",
+        split: str = "test",
+        csv_path: str | None = None,
+        data_root: str | None = None,
         batch_size: int = 16,
         seed: int = 42,
         model_type: str = "pretrained",
@@ -51,7 +53,10 @@ def evaluate_checkpoint(
     
     Args:
         checkpoint_path: Path to checkpoint file or None for pretrained
-        dataset: Path to CSV dataset file
+        dataset_name: Dataset name ("ringreactions", "uspto50k")
+        split: Dataset split ("train", "test", "val")
+        csv_path: Override CSV path for ringreactions
+        data_root: Root directory for datasets
         batch_size: Batch size for evaluation
         seed: Random seed for reproducibility
         model_type: Descriptive name for the model type
@@ -61,23 +66,31 @@ def evaluate_checkpoint(
     """
     seed_everything(seed, workers=True)
     
-    eval_dataset = load_reaction_dataset(Path(dataset), name="evaluation")
-    print_dataset_summary(eval_dataset)
+    if dataset_name.lower() == "ringreactions":
+        path = csv_path or f"{split}_ringreactions.csv"
+        eval_dataset = get_dataset("ringreactions", split=split, csv_path=path, root=data_root)
+    else:
+        eval_dataset = get_dataset(dataset_name, split=split, root=data_root)
     
-    if not eval_dataset.packed:
+    print_dataset_stats(eval_dataset)
+    
+    if len(eval_dataset.packed) == 0:
         raise RuntimeError("No valid reactions available in evaluation dataset.")
     
     model = load_model_from_checkpoint(checkpoint_path, model_type)
     model.eval()
     
     metrics = evaluate_model(model, eval_dataset, batch_size=batch_size, mask_seed=seed)
-    print_metrics(f"{model_type}_on_{eval_dataset.name}", metrics)
+    print_metrics(f"{model_type}_on_{dataset_name}_{split}", metrics)
     
     return metrics
 
 
 def main(
-        dataset: str = "test_ringreactions.csv",
+        dataset: str = "ringreactions",
+        split: str = "test",
+        csv_path: str | None = None,
+        data_root: str | None = None,
         baseline_checkpoint: str | None = None,
         finetuned_checkpoint: str | None = None,
         trained_checkpoint: str | None = None,
@@ -120,7 +133,7 @@ def main(
         print("FINETUNED MODEL EVALUATION")
         print("=" * 80)
         finetuned_metrics = evaluate_checkpoint(
-            finetuned_checkpoint, dataset, batch_size, seed, model_type="finetuned"
+            finetuned_checkpoint, dataset, split, csv_path, data_root, batch_size, seed, model_type="finetuned"
         )
         results["finetuned"] = finetuned_metrics
     
@@ -129,7 +142,7 @@ def main(
         print("TRAINED-FROM-SCRATCH MODEL EVALUATION")
         print("=" * 80)
         trained_metrics = evaluate_checkpoint(
-            trained_checkpoint, dataset, batch_size, seed, model_type="trained"
+            trained_checkpoint, dataset, split, csv_path, data_root, batch_size, seed, model_type="trained"
         )
         results["trained"] = trained_metrics
     
