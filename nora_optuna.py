@@ -21,12 +21,14 @@ def main(
         train: str = "train_ringreactions.csv",
         test: str = "test_ringreactions.csv",
         n_trials: int = 5,
-        max_epochs: int = 100,
+        max_epochs: int | None = None,
         batch_size: int = 16,
         seed: int = 42,
         study_name: str = "rxnmap_optuna",
         use_aim: bool = True,
         mode: Literal["finetune", "scratch"] = "finetune",
+        use_supervised_loss: bool = False,
+        mlm_weight: float = 0.1,
 ):
     train_dataset = load_reaction_dataset(Path(train), name="train")
     test_dataset = load_reaction_dataset(Path(test), name="test")
@@ -38,7 +40,15 @@ def main(
 
     print(f"\n{'=' * 70}")
     print(f"TRAINING MODE: {mode.upper()}")
+    if use_supervised_loss and mode == "finetune":
+        print(f"SUPERVISED LOSS: ENABLED (MLM weight: {mlm_weight})")
+    else:
+        print(f"SUPERVISED LOSS: DISABLED (MLM-only)")
     print(f"{'=' * 70}\n")
+
+    # Set default epochs based on mode if not specified
+    epochs = max_epochs if max_epochs is not None else (10 if mode == "finetune" else 100)
+    print(f"Using max_epochs={epochs} for {mode} mode\n")
 
     baseline_metrics = evaluate_model(
         Model.pretrained(), test_dataset, batch_size=batch_size, mask_seed=seed
@@ -56,13 +66,15 @@ def main(
                 train_dataset,
                 test_dataset,
                 batch_size=batch_size,
-                max_epochs=max_epochs,
+                max_epochs=epochs,
                 seed=seed + trial.number,
                 masking_rate=masking_rate,
                 finetune_learning_rate=learning_rate,
                 run_name=f"{study_name}_trial_{trial.number}",
                 use_aim=use_aim,
                 aim_experiment=study_name,
+                use_supervised_loss=use_supervised_loss,
+                mlm_weight=mlm_weight,
             )
         else:  # mode == "scratch"
             # Higher learning rates and tune dropout for scratch training
@@ -73,7 +85,7 @@ def main(
                 train_dataset,
                 test_dataset,
                 batch_size=batch_size,
-                max_epochs=max_epochs,
+                max_epochs=epochs,
                 seed=seed + trial.number,
                 masking_rate=masking_rate,
                 learning_rate=learning_rate,

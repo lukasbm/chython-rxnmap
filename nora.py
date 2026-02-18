@@ -12,9 +12,12 @@ from chython import smiles
 from pytorch_lightning import Trainer, seed_everything
 from pytorch_lightning.callbacks import TQDMProgressBar
 from pytorch_lightning.loggers import CSVLogger
+from torch import Tensor, rand
 from torch.nn.functional import cross_entropy, normalize
 from torch.optim import AdamW
+from torch.utils.data import DataLoader
 
+from chytorch.utils.data import ReactionDataset
 from chytorch.zoo.rxnmap import Model
 
 
@@ -66,6 +69,175 @@ def build_finetune_model(masking_rate: float, finetune_learning_rate: float) -> 
     model.masking_rate = masking_rate
     model.optimizer = partial(AdamW, lr=finetune_learning_rate)
     return model
+
+
+class SupervisedMappingModel(Model):
+    """Model with supervised mapping loss in addition to MLM loss."""
+    
+    def __init__(self, *args, mlm_weight: float = 0.1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.mlm_weight = mlm_weight
+        self._reactions = None
+    
+    def set_reactions(self, reactions: list[Any]):
+        """Store reactions for supervised mapping loss computation."""
+        self._reactions = reactions
+    
+    def prepare_dataloader_supervised(self, reactions: list[Any], packed: list[bytes], **kwargs):
+        """Prepare dataloader that includes ground truth mappings."""
+        self._reactions = reactions
+        
+        def collate_with_mappings(batch_items):
+            from chytorch.utils.data import collate_reactions
+            # Get standard batch tensors
+            atoms, neighbors, distances, roles = collate_reactions(batch_items)
+            
+            # Extract ground truth mappings for this batch
+            batch_mappings = []
+            for item_idx in range(len(batch_items)):
+                reaction = reactions[item_idx] if item_idx < len(reactions) else None
+                if reaction:
+                    # Extract reactant and product atom mappings
+                    reactant_maps = [n for m in reaction.reactants for n in m]
+                    product_maps = [n for m in reaction.products for n in m]
+                    batch_mappings.append((reactant_maps, product_maps))
+                else:
+                    batch_mappings.append(([], []))
+            
+            return atoms, neighbors, distances, roles, batch_mappings
+        
+        ds = ReactionDataset(packed, distance_cutoff=self.encoder.max_distance, unpack=True)
+        return DataLoader(ds, collate_fn=collate_with_mappings, **kwargs)
+    
+    def compute_mapping_loss(self, embeddings: Tensor, atoms: Tensor, roles: Tensor, 
+                            batch_mappings: list[tuple[list[int], list[int]]]) -> Tensor:
+        """Compute supervised mapping loss from ground truth."""
+        total_loss = torch.tensor(0.0, device=embeddings.device)
+        num_valid = 0
+        
+        batch_size = embeddings.shape[0]
+        for i in range(batch_size):
+            reactant_maps, product_maps = batch_mappings[i]
+            if not reactant_maps or not product_maps:
+                continue
+            
+            role_tokens = roles[i]
+            embedding = embeddings[i]
+            atom_tokens = atoms[i]
+            
+            # Extract reactant and product indices
+            reactant_idx = torch.where(role_tokens == 2)[0]
+            product_idx = torch.where(role_tokens == 3)[0]
+            
+            if len(reactant_maps) != len(reactant_idx) or len(product_maps) != len(product_idx):
+                continue
+            
+            # Build ground truth mapping matrix
+            # gt_mappings[i, j] = 1 if reactant i maps to product j
+            gt_mappings = torch.zeros(len(reactant_idx), len(product_idx), device=embeddings.device)
+            for r_idx, r_map in enumerate(reactant_maps):
+                if r_map > 0:  # 0 means unmapped
+                    for p_idx, p_map in enumerate(product_maps):
+                        if p_map == r_map:
+                            # Also check atom types match
+                            r_atom = atom_tokens[reactant_idx[r_idx]]
+                            p_atom = atom_tokens[product_idx[p_idx]]
+                            if r_atom == p_atom:
+                                gt_mappings[r_idx, p_idx] = 1.0
+            
+            # Skip if no valid mappings
+            if gt_mappings.sum() == 0:
+                continue
+            
+            # Compute similarity matrix (cosine similarity)
+            r_emb = normalize(embedding[reactant_idx], dim=-1)
+            p_emb = normalize(embedding[product_idx], dim=-1)
+            similarity = torch.mm(r_emb, p_emb.t())  # [n_reactants, n_products]
+            
+            # Compute cross-entropy loss for each reactant atom
+            # We want high similarity for correct mappings
+            for r_idx in range(len(reactant_idx)):
+                gt_product = gt_mappings[r_idx]
+                if gt_product.sum() > 0:
+                    # Normalize to get probability distribution
+                    gt_product = gt_product / gt_product.sum()
+                    # Use log_softmax and compute negative log likelihood
+                    log_probs = torch.log_softmax(similarity[r_idx], dim=0)
+                    loss = -(gt_product * log_probs).sum()
+                    total_loss = total_loss + loss
+                    num_valid += 1
+        
+        if num_valid > 0:
+            return total_loss / num_valid
+        return torch.tensor(0.0, device=embeddings.device)
+    
+    def training_step(self, batch, batch_idx):
+        if len(batch) == 5:
+            # Supervised mode with mappings
+            a, n, d, r, batch_mappings = batch
+        else:
+            # Fallback to MLM-only mode
+            a, n, d, r = batch
+            batch_mappings = None
+        
+        m = r > 1  # atoms only
+        
+        # MLM loss (same as parent)
+        ma = a.masked_fill((rand(a.shape, device=a.device) < self.masking_rate) & m, 2)
+        mn = n.masked_fill((rand(n.shape, device=n.device) < self.masking_rate) & m, 1)
+        
+        x = self.encoder((ma, mn, d, r))[m]
+        atoms = self.mlma(x)
+        neighbors = self.mlmn(x)
+        
+        mlm_loss_a = cross_entropy(atoms, a[m].long() - 3)
+        mlm_loss_n = cross_entropy(neighbors, n[m].long() - 2)
+        mlm_loss = mlm_loss_a + mlm_loss_n
+        
+        self.log("trn_loss_mlm_a", mlm_loss_a.item(), sync_dist=True)
+        self.log("trn_loss_mlm_n", mlm_loss_n.item(), sync_dist=True)
+        self.log("trn_loss_mlm", mlm_loss.item(), sync_dist=True)
+        
+        # Supervised mapping loss
+        if batch_mappings is not None:
+            # Get clean embeddings (no masking for mapping)
+            clean_embeddings = self.encoder((a, n, d, r))
+            mapping_loss = self.compute_mapping_loss(clean_embeddings, a, r, batch_mappings)
+            
+            self.log("trn_loss_mapping", mapping_loss.item(), sync_dist=True)
+            
+            # Weighted combination
+            total_loss = mapping_loss + self.mlm_weight * mlm_loss
+            self.log("trn_loss_tot", total_loss.item(), sync_dist=True)
+            return total_loss
+        else:
+            # MLM only
+            self.log("trn_loss_tot", mlm_loss.item(), sync_dist=True)
+            return mlm_loss
+
+
+def build_supervised_finetune_model(
+    masking_rate: float, 
+    finetune_learning_rate: float,
+    mlm_weight: float = 0.1
+) -> SupervisedMappingModel:
+    """Build a model with supervised mapping loss."""
+    # Load pretrained weights into supervised model
+    base_model = Model.pretrained()
+    
+    # Create supervised model with same architecture
+    supervised_model = SupervisedMappingModel(
+        masking_rate=masking_rate,
+        mlm_weight=mlm_weight,
+    )
+    
+    # Copy pretrained weights
+    supervised_model.load_state_dict(base_model.state_dict(), strict=False)
+    
+    # Set optimizer
+    supervised_model.optimizer = partial(AdamW, lr=finetune_learning_rate)
+    
+    return supervised_model
 
 
 def evaluate_mlm_metrics(
@@ -283,11 +455,20 @@ def run_training_experiment(
         run_name: str = "rxnmap_training",
         use_aim: bool = False,
         aim_experiment: str | None = None,
+        use_supervised_loss: bool = False,
 ) -> dict[str, float | str]:
     seed_everything(seed, workers=True)
-    train_loader = model.prepare_dataloader(
-        train_dataset.packed, batch_size=batch_size, shuffle=True
-    )
+    
+    # Use supervised dataloader if model supports it
+    if use_supervised_loss and isinstance(model, SupervisedMappingModel):
+        train_loader = model.prepare_dataloader_supervised(
+            train_dataset.reactions, train_dataset.packed, 
+            batch_size=batch_size, shuffle=True
+        )
+    else:
+        train_loader = model.prepare_dataloader(
+            train_dataset.packed, batch_size=batch_size, shuffle=True
+        )
 
     loggers = [CSVLogger("lightning_logs", name=run_name)]
     if use_aim:
@@ -371,8 +552,16 @@ def run_finetune_experiment(
         run_name: str = "rxnmap_finetune",
         use_aim: bool = False,
         aim_experiment: str | None = None,
+        use_supervised_loss: bool = False,
+        mlm_weight: float = 0.1,
 ) -> dict[str, float | str]:
-    model = build_finetune_model(masking_rate, finetune_learning_rate)
+    if use_supervised_loss:
+        model = build_supervised_finetune_model(
+            masking_rate, finetune_learning_rate, mlm_weight=mlm_weight
+        )
+    else:
+        model = build_finetune_model(masking_rate, finetune_learning_rate)
+    
     return run_training_experiment(
         model,
         train_dataset=train_dataset,
@@ -383,6 +572,7 @@ def run_finetune_experiment(
         run_name=run_name,
         use_aim=use_aim,
         aim_experiment=aim_experiment,
+        use_supervised_loss=use_supervised_loss,
     )
 
 
