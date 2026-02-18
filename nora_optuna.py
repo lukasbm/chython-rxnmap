@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Literal
 
 import fire
 import optuna
@@ -12,6 +13,7 @@ from nora import (
     print_dataset_summary,
     print_metrics,
     run_scratch_experiment,
+    run_finetune_experiment,
 )
 
 
@@ -19,11 +21,12 @@ def main(
         train: str = "train_ringreactions.csv",
         test: str = "test_ringreactions.csv",
         n_trials: int = 5,
-        max_epochs: int = 1,
+        max_epochs: int = 100,
         batch_size: int = 16,
         seed: int = 42,
         study_name: str = "rxnmap_optuna",
         use_aim: bool = True,
+        mode: Literal["finetune", "scratch"] = "finetune",
 ):
     train_dataset = load_reaction_dataset(Path(train), name="train")
     test_dataset = load_reaction_dataset(Path(test), name="test")
@@ -33,6 +36,10 @@ def main(
     if not train_dataset.packed or not test_dataset.packed:
         raise RuntimeError("No valid reactions available after parsing train/test datasets.")
 
+    print(f"\n{'=' * 70}")
+    print(f"TRAINING MODE: {mode.upper()}")
+    print(f"{'=' * 70}\n")
+
     baseline_metrics = evaluate_model(
         Model.pretrained(), test_dataset, batch_size=batch_size, mask_seed=seed
     )
@@ -40,22 +47,41 @@ def main(
 
     def objective(trial: optuna.Trial) -> float:
         masking_rate = trial.suggest_float("masking_rate", 0.05, 0.35)
-        learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
-        dropout = trial.suggest_float("dropout", 0.0, 0.3)
 
-        metrics = run_scratch_experiment(
-            train_dataset,
-            test_dataset,
-            batch_size=batch_size,
-            max_epochs=max_epochs,
-            seed=seed + trial.number,
-            masking_rate=masking_rate,
-            learning_rate=learning_rate,
-            dropout=dropout,
-            run_name=f"{study_name}_trial_{trial.number}",
-            use_aim=use_aim,
-            aim_experiment=study_name,
-        )
+        if mode == "finetune":
+            # Lower learning rates for finetuning
+            learning_rate = trial.suggest_float("learning_rate", 1e-6, 1e-4, log=True)
+
+            metrics = run_finetune_experiment(
+                train_dataset,
+                test_dataset,
+                batch_size=batch_size,
+                max_epochs=max_epochs,
+                seed=seed + trial.number,
+                masking_rate=masking_rate,
+                finetune_learning_rate=learning_rate,
+                run_name=f"{study_name}_trial_{trial.number}",
+                use_aim=use_aim,
+                aim_experiment=study_name,
+            )
+        else:  # mode == "scratch"
+            # Higher learning rates and tune dropout for scratch training
+            learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
+            dropout = trial.suggest_float("dropout", 0.0, 0.3)
+
+            metrics = run_scratch_experiment(
+                train_dataset,
+                test_dataset,
+                batch_size=batch_size,
+                max_epochs=max_epochs,
+                seed=seed + trial.number,
+                masking_rate=masking_rate,
+                learning_rate=learning_rate,
+                dropout=dropout,
+                run_name=f"{study_name}_trial_{trial.number}",
+                use_aim=use_aim,
+                aim_experiment=study_name,
+            )
 
         trial.set_user_attr("mlm_loss_total", metrics["mlm_loss_total"])
         trial.set_user_attr("mlm_loss_atom", metrics["mlm_loss_atom"])
@@ -72,12 +98,13 @@ def main(
 
         # Print trial results
         print(f"\n{'=' * 70}")
-        print(f"TRIAL {trial.number} RESULTS")
+        print(f"TRIAL {trial.number} RESULTS ({mode.upper()})")
         print(f"{'=' * 70}")
         print(f"Hyperparameters:")
         print(f"  masking_rate: {masking_rate:.6f}")
         print(f"  learning_rate: {learning_rate:.6e}")
-        print(f"  dropout: {dropout:.6f}")
+        if mode == "scratch":
+            print(f"  dropout: {dropout:.6f}")
         print(f"Metrics:")
         print(f"  mlm_loss_total: {metrics['mlm_loss_total']:.6f}")
         print(f"  mlm_atom_accuracy: {metrics['mlm_atom_accuracy']:.6f}")

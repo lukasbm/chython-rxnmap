@@ -304,8 +304,12 @@ def run_training_experiment(
             print(f"Warning: aim logging unavailable ({type(e).__name__}: {e}), using CSV logger only")
 
     progress_bar = TQDMProgressBar(refresh_rate=10)
+    
+    # Auto-detect GPU if available, fallback to CPU
+    accelerator = "cuda" if torch.cuda.is_available() else "cpu"
 
     trainer = Trainer(
+        accelerator=accelerator,
         devices=1,
         precision="32",
         max_epochs=max_epochs,
