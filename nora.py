@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import partial
+import json
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +18,14 @@ from torch.utils.data import DataLoader
 from chytorch.utils.data import ReactionDataset
 from chytorch.zoo.rxnmap import Model
 from datasets import ReactionDatasetBase, get_dataset, print_dataset_stats
+
+
+def write_json(path: str | Path, payload: dict[str, Any]) -> str:
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(json.dumps(payload, indent=2))
+    print(f"Wrote artifacts to: {output_path}")
+    return str(output_path)
 
 
 def build_training_model(masking_rate: float, learning_rate: float, dropout: float) -> Model:
@@ -49,28 +58,25 @@ class SupervisedMappingModel(Model):
     def prepare_dataloader_supervised(self, reactions: list[Any], packed: list[bytes], **kwargs):
         """Prepare dataloader that includes ground truth mappings."""
         self._reactions = reactions
-        
+        ds = ReactionDataset(packed, distance_cutoff=self.encoder.max_distance, unpack=True)
+        if len(ds) != len(reactions):
+            raise ValueError(f"Packed reactions ({len(ds)}) and reaction objects ({len(reactions)}) length mismatch.")
+        paired_items = [(ds[idx], reactions[idx]) for idx in range(len(ds))]
+
         def collate_with_mappings(batch_items):
             from chytorch.utils.data import collate_reactions
-            # Get standard batch tensors
-            atoms, neighbors, distances, roles = collate_reactions(batch_items)
+            reaction_batch = [item[0] for item in batch_items]
+            atoms, neighbors, distances, roles = collate_reactions(reaction_batch)
             
-            # Extract ground truth mappings for this batch
             batch_mappings = []
-            for item_idx in range(len(batch_items)):
-                reaction = reactions[item_idx] if item_idx < len(reactions) else None
-                if reaction:
-                    # Extract reactant and product atom mappings
-                    reactant_maps = [n for m in reaction.reactants for n in m]
-                    product_maps = [n for m in reaction.products for n in m]
-                    batch_mappings.append((reactant_maps, product_maps))
-                else:
-                    batch_mappings.append(([], []))
+            for _, reaction in batch_items:
+                reactant_maps = [n for m in reaction.reactants for n in m]
+                product_maps = [n for m in reaction.products for n in m]
+                batch_mappings.append((reactant_maps, product_maps))
             
             return atoms, neighbors, distances, roles, batch_mappings
         
-        ds = ReactionDataset(packed, distance_cutoff=self.encoder.max_distance, unpack=True)
-        return DataLoader(ds, collate_fn=collate_with_mappings, **kwargs)
+        return DataLoader(paired_items, collate_fn=collate_with_mappings, **kwargs)
     
     def compute_mapping_loss(self, embeddings: Tensor, atoms: Tensor, roles: Tensor, 
                             batch_mappings: list[tuple[list[int], list[int]]]) -> Tensor:
@@ -203,6 +209,20 @@ def build_supervised_finetune_model(
     return supervised_model
 
 
+def build_supervised_training_model(
+    masking_rate: float,
+    learning_rate: float,
+    dropout: float,
+    mlm_weight: float = 0.1,
+) -> SupervisedMappingModel:
+    return SupervisedMappingModel(
+        masking_rate=masking_rate,
+        optimizer=partial(AdamW, lr=learning_rate),
+        dropout=dropout,
+        mlm_weight=mlm_weight,
+    )
+
+
 def evaluate_mlm_metrics(
         model: Model, packed_reactions: list[bytes], batch_size: int, mask_seed: int = 0
 ) -> dict[str, float]:
@@ -275,7 +295,12 @@ def _greedy_assignment(similarity: torch.Tensor) -> tuple[list[int], list[float]
     return assigned, scores
 
 
-def evaluate_mapping_metrics(model: Model, dataset: DatasetBundle, top_k: int = 3, batch_size: int = 64) -> dict[str, float]:
+def evaluate_mapping_metrics(
+    model: Model,
+    dataset: ReactionDatasetBase,
+    top_k: int = 3,
+    batch_size: int = 64,
+) -> dict[str, float]:
     """
     Evaluate mapping metrics on dataset using PyTorch dataloader for batched inference.
     
@@ -404,7 +429,7 @@ def evaluate_model(
         model: Model, dataset: ReactionDatasetBase, batch_size: int, mask_seed: int = 0
 ) -> dict[str, float]:
     mlm_metrics = evaluate_mlm_metrics(model, dataset.packed, batch_size=batch_size, mask_seed=mask_seed)
-    mapping_metrics = evaluate_mapping_metrics(model, dataset)
+    mapping_metrics = evaluate_mapping_metrics(model, dataset, batch_size=batch_size)
     return {**mlm_metrics, **mapping_metrics}
 
 
@@ -450,6 +475,12 @@ def run_training_experiment(
     # Auto-detect GPU if available, fallback to CPU
     accelerator = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # Ensure CSV logger dir and checkpoint callback so checkpoints are saved
+    csv_logger = loggers[0]
+    ckpt_dir = Path(csv_logger.log_dir) / "checkpoints"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    callbacks = [progress_bar]
+
     trainer = Trainer(
         accelerator=accelerator,
         devices=1,
@@ -459,19 +490,20 @@ def run_training_experiment(
         log_every_n_steps=10,
         num_sanity_val_steps=0,
         enable_progress_bar=True,
-        callbacks=[progress_bar],
+        callbacks=callbacks,
     )
     model.train()
     trainer.fit(model, train_dataloaders=train_loader)
+    last_checkpoint = ckpt_dir / "last.ckpt"
+    trainer.save_checkpoint(str(last_checkpoint))
 
     test_metrics = evaluate_model(model, test_dataset, batch_size=batch_size, mask_seed=seed)
 
-    csv_logger = loggers[0]
-    last_checkpoint = Path(csv_logger.log_dir) / "checkpoints" / "last.ckpt"
     return {
         **test_metrics,
         "log_dir": csv_logger.log_dir,
         "last_checkpoint": str(last_checkpoint) if last_checkpoint.exists() else "",
+        "test_metrics_json": write_json(Path(csv_logger.log_dir) / "test_metrics.json", test_metrics),
     }
 
 
@@ -487,8 +519,18 @@ def run_scratch_experiment(
         run_name: str = "rxnmap_training",
         use_aim: bool = False,
         aim_experiment: str | None = None,
+        use_supervised_loss: bool = False,
+        mlm_weight: float = 0.1,
 ) -> dict[str, float | str]:
-    model = build_training_model(masking_rate, learning_rate, dropout)
+    if use_supervised_loss:
+        model = build_supervised_training_model(
+            masking_rate=masking_rate,
+            learning_rate=learning_rate,
+            dropout=dropout,
+            mlm_weight=mlm_weight,
+        )
+    else:
+        model = build_training_model(masking_rate, learning_rate, dropout)
     return run_training_experiment(
         model,
         train_dataset=train_dataset,
@@ -499,6 +541,7 @@ def run_scratch_experiment(
         run_name=run_name,
         use_aim=use_aim,
         aim_experiment=aim_experiment,
+        use_supervised_loss=use_supervised_loss,
     )
 
 
@@ -577,7 +620,8 @@ def main(
         dropout: float = 0.1,
         use_aim: bool = False,
         aim_experiment: str | None = None,
-):
+        output_json: str = "experiment_results/nora_main_summary.json",
+) -> dict[str, Any]:
     """
     Train and evaluate reaction mapping models.
     
@@ -674,6 +718,24 @@ def main(
     print(
         f"mapping_exact_match: {finetuned_metrics['mapping_exact_match'] - baseline_metrics['mapping_exact_match']:+.6f}"
     )
+
+    results = {
+        "dataset": dataset,
+        "train_split": train_split,
+        "test_split": test_split,
+        "seed": seed,
+        "batch_size": batch_size,
+        "max_epochs": max_epochs,
+        "masking_rate": masking_rate,
+        "learning_rate": learning_rate,
+        "finetune_learning_rate": finetune_learning_rate,
+        "dropout": dropout,
+        "baseline_test": baseline_metrics,
+        "scratch_test": scratch_metrics,
+        "finetune_test": finetuned_metrics,
+    }
+    results["summary_json"] = write_json(output_json, results)
+    return results
 
 
 if __name__ == "__main__":

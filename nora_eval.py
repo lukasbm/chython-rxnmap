@@ -10,6 +10,7 @@ from nora import (
     Model,
     evaluate_model,
     print_metrics,
+    write_json,
 )
 from datasets import get_dataset, print_dataset_stats
 
@@ -96,7 +97,8 @@ def main(
         trained_checkpoint: str | None = None,
         batch_size: int = 16,
         seed: int = 42,
-):
+        output_json: str = "experiment_results/nora_eval_summary.json",
+) -> dict[str, dict[str, float] | str]:
     """
     Evaluate multiple model checkpoints on a given dataset and compare results.
     
@@ -124,7 +126,14 @@ def main(
     print("BASELINE MODEL EVALUATION")
     print("=" * 80)
     baseline_metrics = evaluate_checkpoint(
-        baseline_checkpoint, dataset, batch_size, seed, model_type="baseline"
+        baseline_checkpoint,
+        dataset_name=dataset,
+        split=split,
+        csv_path=csv_path,
+        data_root=data_root,
+        batch_size=batch_size,
+        seed=seed,
+        model_type="baseline",
     )
     results["baseline"] = baseline_metrics
     
@@ -173,6 +182,16 @@ def main(
                 if model_name != "baseline" and key in metrics:
                     delta = metrics[key] - baseline_value
                     print(f"  {model_name:15s} delta: {delta:+.6f}")
+
+    payload = {
+        "dataset": dataset,
+        "split": split,
+        "seed": seed,
+        "batch_size": batch_size,
+        "results": results,
+    }
+    payload["summary_json"] = write_json(output_json, payload)
+    return payload
 
 
 if __name__ == "__main__":

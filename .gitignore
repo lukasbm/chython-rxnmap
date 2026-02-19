@@ -218,3 +218,8 @@ __marimo__/
 lightning_logs/
 .idea/
 .aim/
+output/
+outputs/
+results/
+experiment_results/
+processed/

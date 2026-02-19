@@ -5,14 +5,15 @@ from typing import Literal
 import fire
 import optuna
 
+from datasets import get_dataset, print_dataset_stats
 from nora import (
     Model,
     evaluate_model,
     print_metrics,
     run_scratch_experiment,
     run_finetune_experiment,
+    write_json,
 )
-from datasets import get_dataset, print_dataset_stats
 
 
 def main(
@@ -29,7 +30,8 @@ def main(
         mode: Literal["finetune", "scratch"] = "finetune",
         use_supervised_loss: bool = False,
         mlm_weight: float = 0.1,
-):
+        output_json: str = "experiment_results/nora_optuna_summary.json",
+) -> dict[str, object]:
     """
     Hyperparameter tuning with Optuna.
     
@@ -45,7 +47,7 @@ def main(
         study_name: Optuna study name
         use_aim: Enable Aim logging
         mode: Training mode ("finetune" or "scratch")
-        use_supervised_loss: Use supervised mapping loss (finetune only)
+        use_supervised_loss: Use supervised mapping loss
         mlm_weight: Weight for MLM loss when using supervised loss
     
     Examples:
@@ -71,7 +73,7 @@ def main(
         test_split = test or "test"
         train_dataset = get_dataset(dataset, split=train_split, root=data_root)
         test_dataset = get_dataset(dataset, split=test_split, root=data_root)
-    
+
     print_dataset_stats(train_dataset)
     print_dataset_stats(test_dataset)
 
@@ -80,7 +82,7 @@ def main(
 
     print(f"\n{'=' * 70}")
     print(f"TRAINING MODE: {mode.upper()}")
-    if use_supervised_loss and mode == "finetune":
+    if use_supervised_loss:
         print(f"SUPERVISED LOSS: ENABLED (MLM weight: {mlm_weight})")
     else:
         print(f"SUPERVISED LOSS: DISABLED (MLM-only)")
@@ -133,6 +135,8 @@ def main(
                 run_name=f"{study_name}_trial_{trial.number}",
                 use_aim=use_aim,
                 aim_experiment=study_name,
+                use_supervised_loss=use_supervised_loss,
+                mlm_weight=mlm_weight,
             )
 
         trial.set_user_attr("mlm_loss_total", metrics["mlm_loss_total"])
@@ -184,6 +188,36 @@ def main(
         f"best_trial_mapping_exact_match: {study.best_trial.user_attrs.get('mapping_exact_match'):.6f}"
     )
     print(f"best_trial_mapping_topk: {study.best_trial.user_attrs.get('mapping_topk'):.6f}")
+
+    trials_summary = []
+    for trial in study.trials:
+        trials_summary.append(
+            {
+                "number": trial.number,
+                "state": str(trial.state),
+                "value": trial.value,
+                "params": trial.params,
+                "user_attrs": trial.user_attrs,
+            }
+        )
+
+    payload = {
+        "study_name": study_name,
+        "mode": mode,
+        "use_supervised_loss": use_supervised_loss,
+        "mlm_weight": mlm_weight,
+        "n_trials": n_trials,
+        "max_epochs": epochs,
+        "batch_size": batch_size,
+        "seed": seed,
+        "best_value": study.best_value,
+        "best_params": study.best_trial.params,
+        "best_user_attrs": study.best_trial.user_attrs,
+        "baseline_metrics_test": baseline_metrics,
+        "trials": trials_summary,
+    }
+    payload["summary_json"] = write_json(output_json, payload)
+    return payload
 
 
 if __name__ == "__main__":
