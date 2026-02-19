@@ -158,3 +158,45 @@ def get_dataset(
 def print_dataset_stats(dataset: ReactionDatasetBase):
     stats = dataset.stats
     print(f"{dataset}: {', '.join(f'{k}={v}' for k, v in stats.items())}")
+
+
+class CombinedReactionDataset:
+    """Combines multiple ReactionDatasetBase instances into one in-memory dataset.
+
+    Usage:
+        combined = CombinedReactionDataset(ring_train, schneider_train)
+    """
+
+    def __init__(self, *datasets: ReactionDatasetBase, name: str | None = None):
+        self.dataset_name = name or "+".join(d.dataset_name for d in datasets)
+        self.split = "combined"
+        self._reactions: list[Any] = [r for d in datasets for r in d.reactions]
+        self._packed: list[bytes] = [p for d in datasets for p in d.packed]
+        self._total: int = sum(d._total for d in datasets)
+        self._failed: int = sum(d._failed for d in datasets)
+
+    @property
+    def reactions(self) -> list[Any]:
+        return self._reactions
+
+    @property
+    def packed(self) -> list[bytes]:
+        return self._packed
+
+    @property
+    def stats(self) -> dict[str, Any]:
+        return {
+            "total": self._total,
+            "valid": len(self._packed),
+            "failed": self._failed,
+            "split": self.split,
+        }
+
+    def __len__(self) -> int:
+        return len(self._packed)
+
+    def __repr__(self) -> str:
+        return (
+            f"CombinedReactionDataset('{self.dataset_name}', "
+            f"n={len(self._packed)}, total={self._total}, failed={self._failed})"
+        )

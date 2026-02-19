@@ -142,45 +142,37 @@ class SupervisedMappingModel(Model):
     
     def training_step(self, batch, batch_idx):
         if len(batch) == 5:
-            # Supervised mode with mappings
             a, n, d, r, batch_mappings = batch
         else:
-            # Fallback to MLM-only mode
             a, n, d, r = batch
             batch_mappings = None
-        
+
         m = r > 1  # atoms only
-        
-        # MLM loss (same as parent)
+
         ma = a.masked_fill((rand(a.shape, device=a.device) < self.masking_rate) & m, 2)
         mn = n.masked_fill((rand(n.shape, device=n.device) < self.masking_rate) & m, 1)
-        
-        x = self.encoder((ma, mn, d, r))[m]
+
+        # Single forward pass — full embeddings used for both MLM and mapping
+        full_embeddings = self.encoder((ma, mn, d, r))
+        x = full_embeddings[m]
         atoms = self.mlma(x)
         neighbors = self.mlmn(x)
-        
+
         mlm_loss_a = cross_entropy(atoms, a[m].long() - 3)
         mlm_loss_n = cross_entropy(neighbors, n[m].long() - 2)
         mlm_loss = mlm_loss_a + mlm_loss_n
-        
+
         self.log("trn_loss_mlm_a", mlm_loss_a.item(), sync_dist=True)
         self.log("trn_loss_mlm_n", mlm_loss_n.item(), sync_dist=True)
         self.log("trn_loss_mlm", mlm_loss.item(), sync_dist=True)
-        
-        # Supervised mapping loss
+
         if batch_mappings is not None:
-            # Get clean embeddings (no masking for mapping)
-            clean_embeddings = self.encoder((a, n, d, r))
-            mapping_loss = self.compute_mapping_loss(clean_embeddings, a, r, batch_mappings)
-            
+            mapping_loss = self.compute_mapping_loss(full_embeddings, a, r, batch_mappings)
             self.log("trn_loss_mapping", mapping_loss.item(), sync_dist=True)
-            
-            # Weighted combination
             total_loss = mapping_loss + self.mlm_weight * mlm_loss
             self.log("trn_loss_tot", total_loss.item(), sync_dist=True)
             return total_loss
         else:
-            # MLM only
             self.log("trn_loss_tot", mlm_loss.item(), sync_dist=True)
             return mlm_loss
 
@@ -444,16 +436,18 @@ def run_training_experiment(
         use_aim: bool = False,
         aim_experiment: str | None = None,
         use_supervised_loss: bool = False,
+        accumulate_grad_batches: int = 1,
+        num_workers: int = 4,
 ) -> dict[str, float | str]:
     seed_everything(seed, workers=True)
     if use_supervised_loss and isinstance(model, SupervisedMappingModel):
         train_loader = model.prepare_dataloader_supervised(
-            train_dataset.reactions, train_dataset.packed, 
-            batch_size=batch_size, shuffle=True
+            train_dataset.reactions, train_dataset.packed,
+            batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0,
         )
     else:
         train_loader = model.prepare_dataloader(
-            train_dataset.packed, batch_size=batch_size, shuffle=True
+            train_dataset.packed, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0,
         )
 
     loggers = [CSVLogger("lightning_logs", name=run_name)]
@@ -471,8 +465,16 @@ def run_training_experiment(
             print(f"Warning: aim logging unavailable ({type(e).__name__}: {e}), using CSV logger only")
 
     progress_bar = TQDMProgressBar(refresh_rate=10)
-    
-    # Auto-detect GPU if available, fallback to CPU
+
+    # Use bf16 on Ada/Ampere, fp16 on older, fp32 fallback
+    if torch.cuda.is_available():
+        if torch.cuda.is_bf16_supported():
+            precision = "bf16-mixed"
+        else:
+            precision = "16-mixed"
+    else:
+        precision = "32"
+
     accelerator = "cuda" if torch.cuda.is_available() else "cpu"
 
     # Ensure CSV logger dir and checkpoint callback so checkpoints are saved
@@ -484,13 +486,14 @@ def run_training_experiment(
     trainer = Trainer(
         accelerator=accelerator,
         devices=1,
-        precision="32",
+        precision=precision,
         max_epochs=max_epochs,
         logger=loggers,
         log_every_n_steps=10,
         num_sanity_val_steps=0,
         enable_progress_bar=True,
         callbacks=callbacks,
+        accumulate_grad_batches=accumulate_grad_batches,
     )
     model.train()
     trainer.fit(model, train_dataloaders=train_loader)
@@ -521,6 +524,8 @@ def run_scratch_experiment(
         aim_experiment: str | None = None,
         use_supervised_loss: bool = False,
         mlm_weight: float = 0.1,
+        accumulate_grad_batches: int = 1,
+        num_workers: int = 4,
 ) -> dict[str, float | str]:
     if use_supervised_loss:
         model = build_supervised_training_model(
@@ -542,6 +547,8 @@ def run_scratch_experiment(
         use_aim=use_aim,
         aim_experiment=aim_experiment,
         use_supervised_loss=use_supervised_loss,
+        accumulate_grad_batches=accumulate_grad_batches,
+        num_workers=num_workers,
     )
 
 
@@ -558,6 +565,8 @@ def run_finetune_experiment(
         aim_experiment: str | None = None,
         use_supervised_loss: bool = False,
         mlm_weight: float = 0.1,
+        accumulate_grad_batches: int = 1,
+        num_workers: int = 4,
 ) -> dict[str, float | str]:
     if use_supervised_loss:
         model = build_supervised_finetune_model(
@@ -565,7 +574,7 @@ def run_finetune_experiment(
         )
     else:
         model = build_finetune_model(masking_rate, finetune_learning_rate)
-    
+
     return run_training_experiment(
         model,
         train_dataset=train_dataset,
@@ -577,6 +586,8 @@ def run_finetune_experiment(
         use_aim=use_aim,
         aim_experiment=aim_experiment,
         use_supervised_loss=use_supervised_loss,
+        accumulate_grad_batches=accumulate_grad_batches,
+        num_workers=num_workers,
     )
 
 

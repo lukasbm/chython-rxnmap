@@ -5,7 +5,7 @@ from typing import Any
 
 import fire
 
-from datasets import get_dataset, print_dataset_stats
+from datasets import CombinedReactionDataset, get_dataset, print_dataset_stats
 from nora import (
     Model,
     evaluate_model,
@@ -52,22 +52,42 @@ def main(
         finetune_learning_rate: float = 1e-5,
         dropout: float = 0.1,
         mlm_weight: float = 0.1,
+        accumulate_grad_batches: int = 1,
+        num_workers: int = 4,
+        use_combined_train: bool = True,
         use_aim: bool = True,
         aim_experiment: str = "ring_comparison",
         output_dir: str = "experiment_results/ring_comparison",
 ) -> dict[str, Any]:
-    train_dataset = get_dataset("ringreactions", split="train")
-    test_dataset = get_dataset("ringreactions", split="test")
+    """Run all ring-reactions comparison scenarios.
 
-    print_dataset_stats(train_dataset)
-    print_dataset_stats(test_dataset)
+    Args:
+        accumulate_grad_batches: Accumulate gradients over N batches (effective batch = batch_size * N).
+            Use to simulate larger batch sizes without extra VRAM.
+        num_workers: DataLoader worker processes. Set 0 to disable.
+        use_combined_train: If True, combine ring train + Schneider50k train as finetuning
+            source (recommended). If False, use ring train only.
+    """
+    ring_train = get_dataset("ringreactions", split="train")
+    ring_test = get_dataset("ringreactions", split="test")
 
-    if len(train_dataset.packed) == 0 or len(test_dataset.packed) == 0:
+    print_dataset_stats(ring_train)
+    print_dataset_stats(ring_test)
+
+    if len(ring_train.packed) == 0 or len(ring_test.packed) == 0:
         raise RuntimeError("No valid reactions available after parsing train/test datasets.")
 
+    if use_combined_train:
+        schneider_train = get_dataset("schneider50k", split="train")
+        print_dataset_stats(schneider_train)
+        finetune_train = CombinedReactionDataset(ring_train, schneider_train, name="ring+schneider-train")
+        print(f"Combined train dataset: {finetune_train}")
+    else:
+        finetune_train = ring_train
+
     finetune_mlm = run_finetune_experiment(
-        train_dataset=train_dataset,
-        test_dataset=test_dataset,
+        train_dataset=finetune_train,
+        test_dataset=ring_test,
         batch_size=batch_size,
         max_epochs=finetune_epochs,
         seed=seed,
@@ -78,10 +98,12 @@ def main(
         aim_experiment=aim_experiment,
         use_supervised_loss=False,
         mlm_weight=mlm_weight,
+        accumulate_grad_batches=accumulate_grad_batches,
+        num_workers=num_workers,
     )
     finetune_supervised = run_finetune_experiment(
-        train_dataset=train_dataset,
-        test_dataset=test_dataset,
+        train_dataset=finetune_train,
+        test_dataset=ring_test,
         batch_size=batch_size,
         max_epochs=finetune_epochs,
         seed=seed + 1,
@@ -92,10 +114,12 @@ def main(
         aim_experiment=aim_experiment,
         use_supervised_loss=True,
         mlm_weight=mlm_weight,
+        accumulate_grad_batches=accumulate_grad_batches,
+        num_workers=num_workers,
     )
     scratch_mlm = run_scratch_experiment(
-        train_dataset=train_dataset,
-        test_dataset=test_dataset,
+        train_dataset=ring_train,
+        test_dataset=ring_test,
         batch_size=batch_size,
         max_epochs=scratch_epochs,
         seed=seed + 2,
@@ -107,10 +131,12 @@ def main(
         aim_experiment=aim_experiment,
         use_supervised_loss=False,
         mlm_weight=mlm_weight,
+        accumulate_grad_batches=accumulate_grad_batches,
+        num_workers=num_workers,
     )
     scratch_supervised = run_scratch_experiment(
-        train_dataset=train_dataset,
-        test_dataset=test_dataset,
+        train_dataset=ring_train,
+        test_dataset=ring_test,
         batch_size=batch_size,
         max_epochs=scratch_epochs,
         seed=seed + 3,
@@ -122,6 +148,8 @@ def main(
         aim_experiment=aim_experiment,
         use_supervised_loss=True,
         mlm_weight=mlm_weight,
+        accumulate_grad_batches=accumulate_grad_batches,
+        num_workers=num_workers,
     )
 
     checkpoints = {
@@ -145,17 +173,14 @@ def main(
         model.eval()
 
     evaluations = {
-        name: _evaluate_splits(model, train_dataset, test_dataset, batch_size=batch_size, seed=seed)
+        name: _evaluate_splits(model, ring_train, ring_test, batch_size=batch_size, seed=seed)
         for name, model in models.items()
     }
     accuracies = _mapping_accuracy_table(evaluations)
-    train_source = str(train_dataset.stats.get("source", "train_ringreactions.csv"))
-    test_source = str(test_dataset.stats.get("source", "test_ringreactions.csv"))
 
     results = {
         "dataset": "ringreactions",
-        "train_source": train_source,
-        "test_source": test_source,
+        "use_combined_train": use_combined_train,
         "batch_size": batch_size,
         "seed": seed,
         "scratch_epochs": scratch_epochs,
@@ -173,8 +198,7 @@ def main(
 
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    results_json = out_dir / "comparison_results.json"
-    results["results_json"] = write_json(results_json, results)
+    results["results_json"] = write_json(out_dir / "comparison_results.json", results)
 
     lines = []
     for split in ("train", "test"):
