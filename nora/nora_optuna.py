@@ -5,8 +5,8 @@ from typing import Literal
 import fire
 import optuna
 
-from datasets import get_dataset, print_dataset_stats
-from nora import (
+from nora.datasets import get_dataset, print_dataset_stats
+from nora.nora import (
     Model,
     evaluate_model,
     print_metrics,
@@ -28,8 +28,6 @@ def main(
         study_name: str = "rxnmap_optuna",
         use_aim: bool = True,
         mode: Literal["finetune", "scratch"] = "finetune",
-        use_supervised_loss: bool = False,
-        mlm_weight: float = 0.1,
         output_json: str = "experiment_results/nora_optuna_summary.json",
 ) -> dict[str, object]:
     """
@@ -47,8 +45,6 @@ def main(
         study_name: Optuna study name
         use_aim: Enable Aim logging
         mode: Training mode ("finetune" or "scratch")
-        use_supervised_loss: Use supervised mapping loss
-        mlm_weight: Weight for MLM loss when using supervised loss
     
     Examples:
         # Ring reactions (default)
@@ -60,8 +56,6 @@ def main(
         # Custom CSV files
         uv run nora_optuna.py --dataset=ringreactions --train=my_train.csv --test=my_test.csv
         
-        # Supervised mapping loss
-        uv run nora_optuna.py --dataset=ringreactions --use_supervised_loss=True
     """
     if dataset.lower() == "ringreactions":
         train_path = train or "train_ringreactions.csv"
@@ -82,10 +76,6 @@ def main(
 
     print(f"\n{'=' * 70}")
     print(f"TRAINING MODE: {mode.upper()}")
-    if use_supervised_loss:
-        print(f"SUPERVISED LOSS: ENABLED (MLM weight: {mlm_weight})")
-    else:
-        print(f"SUPERVISED LOSS: DISABLED (MLM-only)")
     print(f"{'=' * 70}\n")
 
     # Set default epochs based on mode if not specified
@@ -115,8 +105,6 @@ def main(
                 run_name=f"{study_name}_trial_{trial.number}",
                 use_aim=use_aim,
                 aim_experiment=study_name,
-                use_supervised_loss=use_supervised_loss,
-                mlm_weight=mlm_weight,
             )
         else:  # mode == "scratch"
             # Higher learning rates and tune dropout for scratch training
@@ -135,8 +123,6 @@ def main(
                 run_name=f"{study_name}_trial_{trial.number}",
                 use_aim=use_aim,
                 aim_experiment=study_name,
-                use_supervised_loss=use_supervised_loss,
-                mlm_weight=mlm_weight,
             )
 
         trial.set_user_attr("mlm_loss_total", metrics["mlm_loss_total"])
@@ -204,8 +190,6 @@ def main(
     payload = {
         "study_name": study_name,
         "mode": mode,
-        "use_supervised_loss": use_supervised_loss,
-        "mlm_weight": mlm_weight,
         "n_trials": n_trials,
         "max_epochs": epochs,
         "batch_size": batch_size,

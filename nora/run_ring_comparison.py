@@ -5,8 +5,8 @@ from typing import Any
 
 import fire
 
-from datasets import CombinedReactionDataset, get_dataset, print_dataset_stats
-from nora import (
+from nora.datasets import CombinedReactionDataset, get_dataset, print_dataset_stats
+from nora.nora import (
     Model,
     evaluate_model,
     run_finetune_experiment,
@@ -51,7 +51,6 @@ def main(
         learning_rate: float = 1e-4,
         finetune_learning_rate: float = 1e-5,
         dropout: float = 0.1,
-        mlm_weight: float = 0.1,
         accumulate_grad_batches: int = 1,
         num_workers: int = 4,
         use_combined_train: bool = True,
@@ -96,24 +95,6 @@ def main(
         run_name="ring_finetune_mlm",
         use_aim=use_aim,
         aim_experiment=aim_experiment,
-        use_supervised_loss=False,
-        mlm_weight=mlm_weight,
-        accumulate_grad_batches=accumulate_grad_batches,
-        num_workers=num_workers,
-    )
-    finetune_supervised = run_finetune_experiment(
-        train_dataset=finetune_train,
-        test_dataset=ring_test,
-        batch_size=batch_size,
-        max_epochs=finetune_epochs,
-        seed=seed + 1,
-        masking_rate=masking_rate,
-        finetune_learning_rate=finetune_learning_rate,
-        run_name="ring_finetune_supervised",
-        use_aim=use_aim,
-        aim_experiment=aim_experiment,
-        use_supervised_loss=True,
-        mlm_weight=mlm_weight,
         accumulate_grad_batches=accumulate_grad_batches,
         num_workers=num_workers,
     )
@@ -129,34 +110,13 @@ def main(
         run_name="ring_scratch_mlm",
         use_aim=use_aim,
         aim_experiment=aim_experiment,
-        use_supervised_loss=False,
-        mlm_weight=mlm_weight,
-        accumulate_grad_batches=accumulate_grad_batches,
-        num_workers=num_workers,
-    )
-    scratch_supervised = run_scratch_experiment(
-        train_dataset=ring_train,
-        test_dataset=ring_test,
-        batch_size=batch_size,
-        max_epochs=scratch_epochs,
-        seed=seed + 3,
-        masking_rate=masking_rate,
-        learning_rate=learning_rate,
-        dropout=dropout,
-        run_name="ring_scratch_supervised",
-        use_aim=use_aim,
-        aim_experiment=aim_experiment,
-        use_supervised_loss=True,
-        mlm_weight=mlm_weight,
         accumulate_grad_batches=accumulate_grad_batches,
         num_workers=num_workers,
     )
 
     checkpoints = {
         "finetune_mlm": str(finetune_mlm.get("last_checkpoint", "")),
-        "finetune_supervised": str(finetune_supervised.get("last_checkpoint", "")),
         "scratch_mlm": str(scratch_mlm.get("last_checkpoint", "")),
-        "scratch_supervised": str(scratch_supervised.get("last_checkpoint", "")),
     }
     missing = [name for name, ckpt in checkpoints.items() if not ckpt or not Path(ckpt).exists()]
     if missing:
@@ -165,9 +125,7 @@ def main(
     models = {
         "pretrained": Model.pretrained(),
         "finetune_mlm": Model.load_from_checkpoint(checkpoints["finetune_mlm"]),
-        "finetune_supervised": Model.load_from_checkpoint(checkpoints["finetune_supervised"]),
         "scratch_mlm": Model.load_from_checkpoint(checkpoints["scratch_mlm"]),
-        "scratch_supervised": Model.load_from_checkpoint(checkpoints["scratch_supervised"]),
     }
     for model in models.values():
         model.eval()
@@ -189,7 +147,6 @@ def main(
         "learning_rate": learning_rate,
         "finetune_learning_rate": finetune_learning_rate,
         "dropout": dropout,
-        "mlm_weight": mlm_weight,
         "use_aim": use_aim,
         "checkpoints": checkpoints,
         "evaluations": evaluations,
@@ -202,7 +159,7 @@ def main(
 
     lines = []
     for split in ("train", "test"):
-        for model_name in ("pretrained", "finetune_mlm", "finetune_supervised", "scratch_mlm", "scratch_supervised"):
+        for model_name in ("pretrained", "finetune_mlm", "scratch_mlm"):
             lines.append(f"{split.upper()} {model_name} {accuracies[split][model_name]:.6f}")
     accuracies_txt = out_dir / "mapping_atom_accuracy.txt"
     accuracies_txt.write_text("\n".join(lines) + "\n")

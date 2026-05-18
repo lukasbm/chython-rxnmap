@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 import fire
-import torch
 from pytorch_lightning import seed_everything
 
-from nora import (
+from nora.datasets import get_dataset, print_dataset_stats
+from nora.nora import (
     Model,
     evaluate_model,
     print_metrics,
     write_json,
 )
-from datasets import get_dataset, print_dataset_stats
+from pathlib import Path
 
 
 def load_model_from_checkpoint(checkpoint_path: str | None, model_type: str = "pretrained") -> Model:
@@ -103,7 +101,7 @@ def main(
     Evaluate multiple model checkpoints on a given dataset and compare results.
     
     Args:
-        dataset: Path to evaluation dataset CSV file
+        dataset: Dataset name ("ringreactions", "uspto50k")
         baseline_checkpoint: Path to baseline model checkpoint (or None for pretrained)
         finetuned_checkpoint: Path to finetuned model checkpoint (optional)
         trained_checkpoint: Path to trained-from-scratch model checkpoint (optional)
@@ -112,13 +110,13 @@ def main(
     
     Usage:
         # Evaluate pretrained baseline only
-        python nora_eval.py --dataset=test.csv
+        python -m nora.nora_eval --dataset=ringreactions --split=test
         
         # Evaluate baseline and finetuned
-        python nora_eval.py --dataset=test.csv --baseline_checkpoint=ckpt/baseline.ckpt --finetuned_checkpoint=ckpt/finetuned.ckpt
+        python -m nora.nora_eval --dataset=ringreactions --split=test --baseline_checkpoint=ckpt/baseline.ckpt --finetuned_checkpoint=ckpt/finetuned.ckpt
         
         # Evaluate all three models
-        python nora_eval.py --dataset=test.csv --baseline_checkpoint=ckpt/baseline.ckpt --finetuned_checkpoint=ckpt/finetuned.ckpt --trained_checkpoint=ckpt/trained.ckpt
+        python -m nora.nora_eval --dataset=ringreactions --split=test --baseline_checkpoint=ckpt/baseline.ckpt --finetuned_checkpoint=ckpt/finetuned.ckpt --trained_checkpoint=ckpt/trained.ckpt
     """
     results = {}
     

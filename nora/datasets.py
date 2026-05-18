@@ -2,18 +2,27 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from chython import smiles
-from torch_geometric.data import InMemoryDataset
 
 RING_TRAIN_PATH = Path("train_ringreactions.csv")
 RING_TEST_PATH = Path("test_ringreactions.csv")
 SCHNEIDER50K_PATH = Path("schneider50k.tsv")
 SCHNEIDER_COLUMN = "clean_rxn"
 
+DatasetFactory = Callable[..., "ReactionDatasetBase"]
+_DATASET_REGISTRY: dict[str, DatasetFactory] = {}
 
-class ReactionDatasetBase(InMemoryDataset):
+
+def _resolve_path(*, root: str | Path | None, path: str | Path) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute() or root is None:
+        return candidate
+    return Path(root) / candidate
+
+
+class ReactionDatasetBase:
     def __init__(self, dataset_name: str, source: Path, split: str):
         self.dataset_name = dataset_name
         self.source = source
@@ -22,21 +31,6 @@ class ReactionDatasetBase(InMemoryDataset):
         self._packed: list[bytes] = []
         self._total = 0
         self._failed = 0
-        super().__init__(root=".")
-
-    @property
-    def raw_file_names(self) -> list[str]:
-        return []
-
-    @property
-    def processed_file_names(self) -> list[str]:
-        return []
-
-    def download(self):
-        return
-
-    def process(self):
-        return
 
     @property
     def reactions(self) -> list[Any]:
@@ -45,12 +39,6 @@ class ReactionDatasetBase(InMemoryDataset):
     @property
     def packed(self) -> list[bytes]:
         return self._packed
-
-    def len(self) -> int:
-        return len(self._packed)
-
-    def get(self, idx: int) -> bytes:
-        return self._packed[idx]
 
     @property
     def stats(self) -> dict[str, Any]:
@@ -61,6 +49,9 @@ class ReactionDatasetBase(InMemoryDataset):
             "split": self.split,
             "source": str(self.source),
         }
+
+    def __len__(self) -> int:
+        return len(self._packed)
 
     def __repr__(self) -> str:
         return (
@@ -96,38 +87,51 @@ def _parse_reactions(rows: Iterable[str], source: Path) -> tuple[list[Any], list
 
 
 class RingReactionsDataset(ReactionDatasetBase):
-    def __init__(self, split: str = "train", csv_path: str | None = None):
+    def __init__(
+        self,
+        *,
+        split: str = "train",
+        csv_path: str | Path | None = None,
+        root: str | Path | None = None,
+    ):
         if split not in {"train", "test"}:
             raise ValueError(f"ringreactions split must be 'train' or 'test', got '{split}'")
-        path = Path(csv_path) if csv_path else (RING_TRAIN_PATH if split == "train" else RING_TEST_PATH)
-        if not path.exists():
-            raise FileNotFoundError(f"Ring reactions file not found: {path}")
-        super().__init__(dataset_name=f"ringreactions-{split}", source=path, split=split)
-        with path.open("r", newline="") as f:
-            rows = (row[0] for row in csv.reader(f) if row)
-            self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, path)
+        default_path = RING_TRAIN_PATH if split == "train" else RING_TEST_PATH
+        resolved_path = _resolve_path(root=root, path=csv_path or default_path)
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"Ring reactions file not found: {resolved_path}")
+        super().__init__(dataset_name=f"ringreactions-{split}", source=resolved_path, split=split)
+        with resolved_path.open("r", newline="") as handle:
+            rows = (row[0] for row in csv.reader(handle) if row)
+            self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, resolved_path)
 
 
 class Schneider50kDataset(ReactionDatasetBase):
-    def __init__(self, split: str = "train", tsv_path: str | None = None):
+    def __init__(
+        self,
+        *,
+        split: str = "train",
+        tsv_path: str | Path | None = None,
+        root: str | Path | None = None,
+    ):
         if split not in {"train", "val", "test", "all"}:
             raise ValueError(f"schneider50k split must be one of train/val/test/all, got '{split}'")
-        path = Path(tsv_path) if tsv_path else SCHNEIDER50K_PATH
-        if not path.exists():
-            raise FileNotFoundError(f"Schneider file not found: {path}")
-        super().__init__(dataset_name="schneider50k", source=path, split=split)
+        resolved_path = _resolve_path(root=root, path=tsv_path or SCHNEIDER50K_PATH)
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"Schneider file not found: {resolved_path}")
+        super().__init__(dataset_name="schneider50k", source=resolved_path, split=split)
 
-        with path.open("r", newline="") as f:
-            reader = csv.DictReader(f, delimiter="\t")
+        with resolved_path.open("r", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
             all_rows = [row.get(SCHNEIDER_COLUMN, "").strip() for row in reader]
 
-        n = len(all_rows)
-        if n == 0:
+        n_rows = len(all_rows)
+        if n_rows == 0:
             self._reactions, self._packed, self._total, self._failed = [], [], 0, 0
             return
 
-        train_end = int(n * 0.8)
-        val_end = int(n * 0.9)
+        train_end = int(n_rows * 0.8)
+        val_end = int(n_rows * 0.9)
         if split == "train":
             rows = all_rows[:train_end]
         elif split == "val":
@@ -137,7 +141,14 @@ class Schneider50kDataset(ReactionDatasetBase):
         else:
             rows = all_rows
 
-        self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, path)
+        self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, resolved_path)
+
+
+def register_dataset(name: str, factory: DatasetFactory, aliases: tuple[str, ...] = ()) -> None:
+    canonical = name.lower()
+    _DATASET_REGISTRY[canonical] = factory
+    for alias in aliases:
+        _DATASET_REGISTRY[alias.lower()] = factory
 
 
 def get_dataset(
@@ -146,34 +157,28 @@ def get_dataset(
     root: str | Path | None = None,
     **kwargs,
 ) -> ReactionDatasetBase:
-    del root  # kept for API compatibility; dataset paths are intentionally fixed/simple
-    name_lower = name.lower()
-    if name_lower == "ringreactions":
-        return RingReactionsDataset(split=split, csv_path=kwargs.get("csv_path"))
-    if name_lower in {"schneider50k", "uspto50k"}:
-        return Schneider50kDataset(split=split, tsv_path=kwargs.get("tsv_path"))
-    raise ValueError("Unknown dataset. Use 'ringreactions' or 'schneider50k'.")
+    factory = _DATASET_REGISTRY.get(name.lower())
+    if factory is None:
+        known = ", ".join(sorted(set(_DATASET_REGISTRY)))
+        raise ValueError(f"Unknown dataset '{name}'. Registered datasets: {known}")
+    return factory(split=split, root=root, **kwargs)
 
 
-def print_dataset_stats(dataset: ReactionDatasetBase):
+def print_dataset_stats(dataset: ReactionDatasetBase) -> None:
     stats = dataset.stats
-    print(f"{dataset}: {', '.join(f'{k}={v}' for k, v in stats.items())}")
+    print(f"{dataset}: {', '.join(f'{key}={value}' for key, value in stats.items())}")
 
 
 class CombinedReactionDataset:
-    """Combines multiple ReactionDatasetBase instances into one in-memory dataset.
-
-    Usage:
-        combined = CombinedReactionDataset(ring_train, schneider_train)
-    """
+    """Combines multiple datasets into one in-memory dataset."""
 
     def __init__(self, *datasets: ReactionDatasetBase, name: str | None = None):
-        self.dataset_name = name or "+".join(d.dataset_name for d in datasets)
+        self.dataset_name = name or "+".join(dataset.dataset_name for dataset in datasets)
         self.split = "combined"
-        self._reactions: list[Any] = [r for d in datasets for r in d.reactions]
-        self._packed: list[bytes] = [p for d in datasets for p in d.packed]
-        self._total: int = sum(d._total for d in datasets)
-        self._failed: int = sum(d._failed for d in datasets)
+        self._reactions: list[Any] = [reaction for dataset in datasets for reaction in dataset.reactions]
+        self._packed: list[bytes] = [packed for dataset in datasets for packed in dataset.packed]
+        self._total: int = sum(dataset._total for dataset in datasets)
+        self._failed: int = sum(dataset._failed for dataset in datasets)
 
     @property
     def reactions(self) -> list[Any]:
@@ -200,3 +205,7 @@ class CombinedReactionDataset:
             f"CombinedReactionDataset('{self.dataset_name}', "
             f"n={len(self._packed)}, total={self._total}, failed={self._failed})"
         )
+
+
+register_dataset("ringreactions", RingReactionsDataset)
+register_dataset("schneider50k", Schneider50kDataset, aliases=("uspto50k",))
