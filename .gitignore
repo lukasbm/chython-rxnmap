@@ -215,7 +215,7 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-lightning_logs/
+lightning_logs
 .idea/
 .aim/
 output/
