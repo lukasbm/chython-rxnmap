@@ -223,3 +223,6 @@ outputs/
 results/
 experiment_results/
 processed/
+
+data/
+

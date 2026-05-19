@@ -10,6 +10,9 @@ RING_TRAIN_PATH = Path("train_ringreactions.csv")
 RING_TEST_PATH = Path("test_ringreactions.csv")
 SCHNEIDER50K_PATH = Path("schneider50k.tsv")
 SCHNEIDER_COLUMN = "clean_rxn"
+METAMDB_TRAIN_PATH = Path("train_metamdb_filtered.csv")
+METAMDB_TEST_PATH = Path("test_metamdb_filtered.csv")
+METAMDB_DELIMITER = ";"
 
 DatasetFactory = Callable[..., "ReactionDatasetBase"]
 _DATASET_REGISTRY: dict[str, DatasetFactory] = {}
@@ -144,6 +147,28 @@ class Schneider50kDataset(ReactionDatasetBase):
         self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, resolved_path)
 
 
+class MetamdbDataset(ReactionDatasetBase):
+    def __init__(
+        self,
+        *,
+        split: str = "train",
+        csv_path: str | Path | None = None,
+        root: str | Path | None = None,
+    ):
+        if split not in {"train", "test"}:
+            raise ValueError(f"metamdb split must be 'train' or 'test', got '{split}'")
+        default_path = METAMDB_TRAIN_PATH if split == "train" else METAMDB_TEST_PATH
+        resolved_path = _resolve_path(root=root, path=csv_path or default_path)
+        if not resolved_path.exists():
+            raise FileNotFoundError(f"MetaDB file not found: {resolved_path}")
+        super().__init__(dataset_name=f"metamdb-{split}", source=resolved_path, split=split)
+        with resolved_path.open("r", newline="") as handle:
+            # MetaDB format: id;reaction_smiles
+            # Parse second column (index 1) which contains the reaction
+            rows = (row[1] for row in csv.reader(handle, delimiter=METAMDB_DELIMITER) if row and len(row) > 1)
+            self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, resolved_path)
+
+
 def register_dataset(name: str, factory: DatasetFactory, aliases: tuple[str, ...] = ()) -> None:
     canonical = name.lower()
     _DATASET_REGISTRY[canonical] = factory
@@ -209,3 +234,4 @@ class CombinedReactionDataset:
 
 register_dataset("ringreactions", RingReactionsDataset)
 register_dataset("schneider50k", Schneider50kDataset, aliases=("uspto50k",))
+register_dataset("metamdb", MetamdbDataset)

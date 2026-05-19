@@ -18,14 +18,6 @@ from chytorch.zoo.rxnmap import Model
 from nora.datasets import ReactionDatasetBase, get_dataset, print_dataset_stats
 
 
-def write_json(path: str | Path, payload: dict[str, Any]) -> str:
-    output_path = Path(path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_text(json.dumps(payload, indent=2))
-    print(f"Wrote artifacts to: {output_path}")
-    return str(output_path)
-
-
 def build_training_model(masking_rate: float, learning_rate: float, dropout: float) -> Model:
     return Model(
         masking_rate=masking_rate,
