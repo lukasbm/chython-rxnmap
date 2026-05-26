@@ -2,20 +2,9 @@ from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
 from chython import smiles
-
-RING_TRAIN_PATH = Path("train_ringreactions.csv")
-RING_TEST_PATH = Path("test_ringreactions.csv")
-SCHNEIDER50K_PATH = Path("schneider50k.tsv")
-SCHNEIDER_COLUMN = "clean_rxn"
-METAMDB_TRAIN_PATH = Path("train_metamdb_filtered.csv")
-METAMDB_TEST_PATH = Path("test_metamdb_filtered.csv")
-METAMDB_DELIMITER = ";"
-
-DatasetFactory = Callable[..., "ReactionDatasetBase"]
-_DATASET_REGISTRY: dict[str, DatasetFactory] = {}
 
 
 def _resolve_path(*, root: str | Path | None, path: str | Path) -> Path:
@@ -25,8 +14,87 @@ def _resolve_path(*, root: str | Path | None, path: str | Path) -> Path:
     return Path(root) / candidate
 
 
+def _read_lines(path: Path) -> list[str]:
+    with path.open("r") as handle:
+        return [line.strip() for line in handle if line.strip()]
+
+
+def _read_csv_column(
+    path: Path,
+    *,
+    delimiter: str = ",",
+    column_index: int = 0,
+) -> list[str]:
+    with path.open("r", newline="") as handle:
+        rows = []
+        for row in csv.reader(handle, delimiter=delimiter):
+            if not row or len(row) <= column_index:
+                continue
+            value = row[column_index].strip()
+            if value:
+                rows.append(value)
+        return rows
+
+
+def _read_tsv_column(path: Path, column: str) -> list[str]:
+    with path.open("r", newline="") as handle:
+        reader = csv.DictReader(handle, delimiter="\t")
+        rows = []
+        for row in reader:
+            value = row.get(column, "").strip()
+            if value:
+                rows.append(value)
+        return rows
+
+
+def _split_rows(
+    rows: list[str],
+    *,
+    split: str,
+    train_ratio: float = 0.8,
+    val_ratio: float = 0.1,
+) -> list[str]:
+    if split not in {"train", "val", "test"}:
+        raise ValueError(f"split must be 'train', 'val', or 'test', got '{split}'")
+    if not rows:
+        return []
+    train_end = int(len(rows) * train_ratio)
+    val_end = int(len(rows) * (train_ratio + val_ratio))
+    if split == "train":
+        return rows[:train_end]
+    if split == "val":
+        return rows[train_end:val_end]
+    return rows[val_end:]
+
+
+def _parse_reactions(rows: Iterable[str], source: Path) -> tuple[list[Any], list[bytes], int, int]:
+    reactions: list[Any] = []
+    packed: list[bytes] = []
+    total = 0
+    failed = 0
+    warning_count = 0
+
+    for row in rows:
+        reaction_smiles = row.strip()
+        if not reaction_smiles:
+            continue
+        total += 1
+        try:
+            reaction = smiles(reaction_smiles)
+            reaction.canonicalize()
+            reactions.append(reaction)
+            packed.append(reaction.pack())
+        except Exception as exc:
+            failed += 1
+            if warning_count < 10:
+                print(f"Warning: failed to parse reaction #{total} from {source}: {exc}")
+                warning_count += 1
+
+    return reactions, packed, total, failed
+
+
 class ReactionDatasetBase:
-    def __init__(self, dataset_name: str, source: Path, split: str):
+    def __init__(self, dataset_name: str, source: Path, split: str, rows: Iterable[str]):
         self.dataset_name = dataset_name
         self.source = source
         self.split = split
@@ -34,6 +102,7 @@ class ReactionDatasetBase:
         self._packed: list[bytes] = []
         self._total = 0
         self._failed = 0
+        self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, source)
 
     @property
     def reactions(self) -> list[Any]:
@@ -63,53 +132,29 @@ class ReactionDatasetBase:
         )
 
 
-def _parse_reactions(rows: Iterable[str], source: Path) -> tuple[list[Any], list[bytes], int, int]:
-    reactions: list[Any] = []
-    packed: list[bytes] = []
-    total = 0
-    failed = 0
-    warning_count = 0
+class GoldenDataset(ReactionDatasetBase):
+    DEFAULT_SMILES_PATH = Path("golden.smiles")
 
-    for row in rows:
-        reaction_smiles = row.strip()
-        if not reaction_smiles:
-            continue
-        total += 1
-        try:
-            reaction = smiles(reaction_smiles)
-            reaction.canonicalize()
-            reactions.append(reaction)
-            packed.append(reaction.pack())
-        except Exception as exc:
-            failed += 1
-            if warning_count < 10:
-                print(f"Warning: failed to parse reaction #{total} from {source}: {exc}")
-                warning_count += 1
-
-    return reactions, packed, total, failed
-
-
-class RingReactionsDataset(ReactionDatasetBase):
     def __init__(
         self,
         *,
         split: str = "train",
-        csv_path: str | Path | None = None,
+        smiles_path: str | Path | None = None,
         root: str | Path | None = None,
     ):
-        if split not in {"train", "test"}:
-            raise ValueError(f"ringreactions split must be 'train' or 'test', got '{split}'")
-        default_path = RING_TRAIN_PATH if split == "train" else RING_TEST_PATH
-        resolved_path = _resolve_path(root=root, path=csv_path or default_path)
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"golden split must be 'train', 'val', or 'test', got '{split}'")
+        resolved_path = _resolve_path(root=root, path=smiles_path or self.DEFAULT_SMILES_PATH)
         if not resolved_path.exists():
-            raise FileNotFoundError(f"Ring reactions file not found: {resolved_path}")
-        super().__init__(dataset_name=f"ringreactions-{split}", source=resolved_path, split=split)
-        with resolved_path.open("r", newline="") as handle:
-            rows = (row[0] for row in csv.reader(handle) if row)
-            self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, resolved_path)
+            raise FileNotFoundError(f"Golden file not found: {resolved_path}")
+        rows = _split_rows(_read_lines(resolved_path), split=split)
+        super().__init__(dataset_name="golden", source=resolved_path, split=split, rows=rows)
 
 
 class Schneider50kDataset(ReactionDatasetBase):
+    DEFAULT_TSV_PATH = Path("schneider50k.tsv")
+    COLUMN = "clean_rxn"
+
     def __init__(
         self,
         *,
@@ -117,37 +162,19 @@ class Schneider50kDataset(ReactionDatasetBase):
         tsv_path: str | Path | None = None,
         root: str | Path | None = None,
     ):
-        if split not in {"train", "val", "test", "all"}:
-            raise ValueError(f"schneider50k split must be one of train/val/test/all, got '{split}'")
-        resolved_path = _resolve_path(root=root, path=tsv_path or SCHNEIDER50K_PATH)
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"schneider50k split must be 'train', 'val', or 'test', got '{split}'")
+        resolved_path = _resolve_path(root=root, path=tsv_path or self.DEFAULT_TSV_PATH)
         if not resolved_path.exists():
             raise FileNotFoundError(f"Schneider file not found: {resolved_path}")
-        super().__init__(dataset_name="schneider50k", source=resolved_path, split=split)
-
-        with resolved_path.open("r", newline="") as handle:
-            reader = csv.DictReader(handle, delimiter="\t")
-            all_rows = [row.get(SCHNEIDER_COLUMN, "").strip() for row in reader]
-
-        n_rows = len(all_rows)
-        if n_rows == 0:
-            self._reactions, self._packed, self._total, self._failed = [], [], 0, 0
-            return
-
-        train_end = int(n_rows * 0.8)
-        val_end = int(n_rows * 0.9)
-        if split == "train":
-            rows = all_rows[:train_end]
-        elif split == "val":
-            rows = all_rows[train_end:val_end]
-        elif split == "test":
-            rows = all_rows[val_end:]
-        else:
-            rows = all_rows
-
-        self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, resolved_path)
+        rows = _split_rows(_read_tsv_column(resolved_path, self.COLUMN), split=split)
+        super().__init__(dataset_name="schneider50k", source=resolved_path, split=split, rows=rows)
 
 
-class MetamdbDataset(ReactionDatasetBase):
+class RingReactionsDataset(ReactionDatasetBase):
+    TRAIN_PATH = Path("train_ringreactions.csv")
+    TEST_PATH = Path("test_ringreactions.csv")
+
     def __init__(
         self,
         *,
@@ -155,44 +182,57 @@ class MetamdbDataset(ReactionDatasetBase):
         csv_path: str | Path | None = None,
         root: str | Path | None = None,
     ):
-        if split not in {"train", "test"}:
-            raise ValueError(f"metamdb split must be 'train' or 'test', got '{split}'")
-        default_path = METAMDB_TRAIN_PATH if split == "train" else METAMDB_TEST_PATH
-        resolved_path = _resolve_path(root=root, path=csv_path or default_path)
-        if not resolved_path.exists():
-            raise FileNotFoundError(f"MetaDB file not found: {resolved_path}")
-        super().__init__(dataset_name=f"metamdb-{split}", source=resolved_path, split=split)
-        with resolved_path.open("r", newline="") as handle:
-            # MetaDB format: id;reaction_smiles
-            # Parse second column (index 1) which contains the reaction
-            rows = (row[1] for row in csv.reader(handle, delimiter=METAMDB_DELIMITER) if row and len(row) > 1)
-            self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, resolved_path)
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"ringreactions split must be 'train', 'val', or 'test', got '{split}'")
+        if split == "test":
+            resolved_path = _resolve_path(root=root, path=csv_path or self.TEST_PATH)
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"Ring reactions file not found: {resolved_path}")
+            rows = _read_csv_column(resolved_path)
+        else:
+            resolved_path = _resolve_path(root=root, path=csv_path or self.TRAIN_PATH)
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"Ring reactions file not found: {resolved_path}")
+            rows = _split_rows(_read_csv_column(resolved_path), split=split, train_ratio=0.9, val_ratio=0.1)
+        super().__init__(dataset_name="ringreactions", source=resolved_path, split=split, rows=rows)
 
 
-def register_dataset(name: str, factory: DatasetFactory, aliases: tuple[str, ...] = ()) -> None:
-    canonical = name.lower()
-    _DATASET_REGISTRY[canonical] = factory
-    for alias in aliases:
-        _DATASET_REGISTRY[alias.lower()] = factory
+class MetamdbDataset(ReactionDatasetBase):
+    TRAIN_PATH = Path("train_metamdb_filtered.csv")
+    TEST_PATH = Path("test_metamdb_filtered.csv")
+    DELIMITER = ";"
 
-
-def get_dataset(
-    name: str,
-    split: str = "train",
-    root: str | Path | None = None,
-    **kwargs,
-) -> ReactionDatasetBase:
-    factory = _DATASET_REGISTRY.get(name.lower())
-    if factory is None:
-        known = ", ".join(sorted(set(_DATASET_REGISTRY)))
-        raise ValueError(f"Unknown dataset '{name}'. Registered datasets: {known}")
-    return factory(split=split, root=root, **kwargs)
+    def __init__(
+        self,
+        *,
+        split: str = "train",
+        csv_path: str | Path | None = None,
+        root: str | Path | None = None,
+    ):
+        if split not in {"train", "val", "test"}:
+            raise ValueError(f"metamdb split must be 'train', 'val', or 'test', got '{split}'")
+        if split == "test":
+            resolved_path = _resolve_path(root=root, path=csv_path or self.TEST_PATH)
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"MetaDB file not found: {resolved_path}")
+            rows = _read_csv_column(resolved_path, delimiter=self.DELIMITER, column_index=1)
+        else:
+            resolved_path = _resolve_path(root=root, path=csv_path or self.TRAIN_PATH)
+            if not resolved_path.exists():
+                raise FileNotFoundError(f"MetaDB file not found: {resolved_path}")
+            rows = _split_rows(
+                _read_csv_column(resolved_path, delimiter=self.DELIMITER, column_index=1),
+                split=split,
+                train_ratio=0.9,
+                val_ratio=0.1,
+            )
+        super().__init__(dataset_name="metamdb", source=resolved_path, split=split, rows=rows)
 
 
 def print_dataset_stats(dataset: ReactionDatasetBase) -> None:
     stats = dataset.stats
     print(f"{dataset}: {', '.join(f'{key}={value}' for key, value in stats.items())}")
-
+ 
 
 class CombinedReactionDataset:
     """Combines multiple datasets into one in-memory dataset."""
@@ -230,8 +270,3 @@ class CombinedReactionDataset:
             f"CombinedReactionDataset('{self.dataset_name}', "
             f"n={len(self._packed)}, total={self._total}, failed={self._failed})"
         )
-
-
-register_dataset("ringreactions", RingReactionsDataset)
-register_dataset("schneider50k", Schneider50kDataset, aliases=("uspto50k",))
-register_dataset("metamdb", MetamdbDataset)

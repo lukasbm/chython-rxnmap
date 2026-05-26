@@ -6,438 +6,135 @@ from pathlib import Path
 from typing import Any
 
 import fire
-import torch
 from pytorch_lightning import Trainer, seed_everything
-from pytorch_lightning.callbacks import TQDMProgressBar
 from pytorch_lightning.loggers import CSVLogger
-from torch import rand
-from torch.nn.functional import cross_entropy
 from torch.optim import AdamW
 
 from chytorch.zoo.rxnmap import Model
-from nora.datasets import ReactionDatasetBase, get_dataset, print_dataset_stats
+from nora.datasets import (
+    GoldenDataset,
+    MetamdbDataset,
+    RingReactionsDataset,
+    Schneider50kDataset,
+    print_dataset_stats,
+)
 
 
-def build_training_model(masking_rate: float, learning_rate: float, dropout: float) -> Model:
-    return Model(
-        masking_rate=masking_rate,
-        optimizer=partial(AdamW, lr=learning_rate),
-        dropout=dropout,
-    )
+def write_json(path: Path | str, payload: dict[str, Any]) -> str:
+    output = Path(path)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(payload, indent=2, sort_keys=True))
+    return str(output)
 
 
-def build_finetune_model(masking_rate: float, finetune_learning_rate: float) -> Model:
-    model = Model.pretrained()
-    model.masking_rate = masking_rate
-    model.optimizer = partial(AdamW, lr=finetune_learning_rate)
-    return model
-
-
-def evaluate_mlm_metrics(
-    model: Model, packed_reactions: list[bytes], batch_size: int, mask_seed: int = 0
-) -> dict[str, float]:
-    dataloader = model.prepare_dataloader(packed_reactions, batch_size=batch_size, shuffle=False)
-    model.eval()
-    rng = torch.Generator()
-    rng.manual_seed(mask_seed)
-
-    atom_total = 0
-    atom_correct = 0
-    neighbor_total = 0
-    neighbor_correct = 0
-    atom_loss_sum = 0.0
-    neighbor_loss_sum = 0.0
-
-    with torch.no_grad():
-        for a, n, d, r in dataloader:
-            atom_mask = r > 1
-            random_atoms = torch.rand(a.shape, generator=rng, device=a.device)
-            random_neighbors = torch.rand(n.shape, generator=rng, device=n.device)
-            masked_atoms = a.masked_fill((random_atoms < model.masking_rate) & atom_mask, 2)
-            masked_neighbors = n.masked_fill((random_neighbors < model.masking_rate) & atom_mask, 1)
-
-            embedding = model.encoder((masked_atoms, masked_neighbors, d, r))[atom_mask]
-            atom_logits = model.mlma(embedding)
-            neighbor_logits = model.mlmn(embedding)
-            atom_target = a[atom_mask].long() - 3
-            neighbor_target = n[atom_mask].long() - 2
-
-            atom_loss = cross_entropy(atom_logits, atom_target)
-            neighbor_loss = cross_entropy(neighbor_logits, neighbor_target)
-
-            atom_count = atom_target.numel()
-            atom_total += atom_count
-            neighbor_total += atom_count
-            atom_correct += (atom_logits.argmax(dim=-1) == atom_target).sum().item()
-            neighbor_correct += (neighbor_logits.argmax(dim=-1) == neighbor_target).sum().item()
-            atom_loss_sum += atom_loss.item() * atom_count
-            neighbor_loss_sum += neighbor_loss.item() * atom_count
-
-    atom_loss_value = atom_loss_sum / atom_total
-    neighbor_loss_value = neighbor_loss_sum / neighbor_total
-    total_loss_value = atom_loss_value + neighbor_loss_value
-    return {
-        "mlm_loss_total": total_loss_value,
-        "mlm_loss_atom": atom_loss_value,
-        "mlm_loss_neighbor": neighbor_loss_value,
-        "mlm_atom_accuracy": atom_correct / atom_total,
-        "mlm_neighbor_accuracy": neighbor_correct / neighbor_total,
-        "mlm_perplexity": float(torch.exp(torch.tensor(total_loss_value)).item()),
+def build_model(mode: str, masking_rate: float, learning_rate: float, dropout: float) -> Model:
+    model_kwargs = {
+        "masking_rate": masking_rate,
+        "optimizer": partial(AdamW, lr=learning_rate),
+        "dropout": dropout,
     }
+    if mode == "pretrained":
+        return Model.pretrained(**model_kwargs)
+    if mode == "scratch":
+        return Model(**model_kwargs)
+    raise ValueError("mode must be 'scratch' or 'pretrained'")
 
 
-def _extract_attention_tensor(mapping_output: Any) -> torch.Tensor:
-    if torch.is_tensor(mapping_output):
-        tensor = mapping_output
-    elif isinstance(mapping_output, (list, tuple)):
-        nested: list[Any] = list(mapping_output)
-        tensor = None
-        while nested:
-            candidate = nested.pop(0)
-            if torch.is_tensor(candidate):
-                tensor = candidate
-                break
-            if isinstance(candidate, (list, tuple)):
-                nested.extend(candidate)
-        if tensor is None:
-            raise ValueError("mapping_task output does not contain a tensor")
-    else:
-        raise ValueError(f"Unsupported mapping_task output type: {type(mapping_output).__name__}")
-
-    if tensor.ndim == 4:
-        return tensor.mean(dim=1)
-    if tensor.ndim == 3:
-        return tensor
-    if tensor.ndim == 2:
-        return tensor.unsqueeze(0)
-    raise ValueError(f"Unsupported attention tensor shape: {tuple(tensor.shape)}")
-
-
-def _mapping_similarity_from_attention(
-    attention: torch.Tensor, reactant_token_idx: torch.Tensor, product_token_idx: torch.Tensor
-) -> torch.Tensor:
-    product_to_reactant = attention.index_select(0, product_token_idx).index_select(1, reactant_token_idx)
-    reactant_to_product = (
-        attention.index_select(0, reactant_token_idx).index_select(1, product_token_idx).transpose(0, 1)
-    )
-    return 0.5 * (product_to_reactant + reactant_to_product)
-
-
-def _greedy_assignment(similarity: torch.Tensor) -> tuple[list[int], list[float]]:
-    n_product, n_reactant = similarity.shape
-    work = similarity.clone()
-    assigned = [-1] * n_product
-    scores = [float("nan")] * n_product
-
-    for _ in range(min(n_product, n_reactant)):
-        best_score, flat_index = torch.max(work.reshape(-1), dim=0)
-        if not torch.isfinite(best_score) or best_score.item() <= -1e8:
-            break
-        product_idx = int(flat_index.item() // n_reactant)
-        reactant_idx = int(flat_index.item() % n_reactant)
-        assigned[product_idx] = reactant_idx
-        scores[product_idx] = float(best_score.item())
-        work[product_idx, :] = -1e9
-        work[:, reactant_idx] = -1e9
-    return assigned, scores
-
-
-def evaluate_mapping_metrics(
-    model: Model,
-    dataset: ReactionDatasetBase,
-    top_k: int = 3,
-    batch_size: int = 64,
-) -> dict[str, float]:
-    """
-    Evaluate mapping metrics via the model's original mapping path:
-    `model(batch, mapping_task=True)`.
-    """
-    model.eval()
-
-    mapped_reactions = 0
-    exact_matches = 0
-    mappable_atoms = 0
-    correct_atoms = 0
-    top1_hits = 0
-    topk_hits = 0
-    assigned_atoms = 0
-    score_sum = 0.0
-    score_count = 0
-
-    with torch.no_grad():
-        dataloader = model.prepare_dataloader(dataset.packed, batch_size=batch_size, shuffle=False)
-        reaction_idx = 0
-
-        for batch in dataloader:
-            atoms, _, _, roles = batch
-            attention_batch = _extract_attention_tensor(model(batch, mapping_task=True))
-            if attention_batch.shape[0] != atoms.shape[0]:
-                raise ValueError(
-                    f"mapping_task batch mismatch: attention batch={attention_batch.shape[0]} "
-                    f"vs token batch={atoms.shape[0]}"
-                )
-
-            batch_size_actual = atoms.shape[0]
-            for i in range(batch_size_actual):
-                if reaction_idx >= len(dataset.reactions):
-                    break
-
-                reaction = dataset.reactions[reaction_idx]
-                reaction_idx += 1
-
-                atom_tokens = atoms[i]
-                role_tokens = roles[i]
-                attention = attention_batch[i]
-
-                reactant_token_idx = torch.where(role_tokens == 2)[0]
-                product_token_idx = torch.where(role_tokens == 3)[0]
-                if reactant_token_idx.numel() == 0 or product_token_idx.numel() == 0:
-                    continue
-
-                reactant_maps = [mapping for molecule in reaction.reactants for mapping in molecule]
-                product_maps = [mapping for molecule in reaction.products for mapping in molecule]
-                if len(reactant_maps) != reactant_token_idx.numel() or len(product_maps) != product_token_idx.numel():
-                    continue
-
-                reactant_map_to_local = {map_num: idx for idx, map_num in enumerate(reactant_maps)}
-                similarity = _mapping_similarity_from_attention(
-                    attention,
-                    reactant_token_idx=reactant_token_idx,
-                    product_token_idx=product_token_idx,
-                )
-
-                reactant_types = atom_tokens[reactant_token_idx]
-                product_types = atom_tokens[product_token_idx]
-                same_atom_type = product_types[:, None] == reactant_types[None, :]
-                similarity = similarity.masked_fill(~same_atom_type, -1e9)
-
-                assigned, assigned_scores = _greedy_assignment(similarity)
-
-                has_mappable_atom = False
-                reaction_is_exact = True
-                for product_local_idx, product_map_num in enumerate(product_maps):
-                    reactant_local_idx = reactant_map_to_local.get(product_map_num)
-                    if reactant_local_idx is None:
-                        continue
-                    has_mappable_atom = True
-                    mappable_atoms += 1
-
-                    ranked_indices = torch.topk(
-                        similarity[product_local_idx],
-                        k=min(top_k, similarity.shape[1]),
-                    ).indices.tolist()
-                    if ranked_indices and ranked_indices[0] == reactant_local_idx:
-                        top1_hits += 1
-                    if reactant_local_idx in ranked_indices:
-                        topk_hits += 1
-
-                    predicted_local_idx = assigned[product_local_idx]
-                    if predicted_local_idx != -1:
-                        assigned_atoms += 1
-                        score_sum += assigned_scores[product_local_idx]
-                        score_count += 1
-                    if predicted_local_idx == reactant_local_idx:
-                        correct_atoms += 1
-                    else:
-                        reaction_is_exact = False
-
-                if has_mappable_atom:
-                    mapped_reactions += 1
-                    if reaction_is_exact:
-                        exact_matches += 1
-
-    if mappable_atoms == 0:
-        return {
-            "mapping_atom_accuracy": 0.0,
-            "mapping_exact_match": 0.0,
-            "mapping_top1": 0.0,
-            "mapping_topk": 0.0,
-            "mapping_assignment_coverage": 0.0,
-            "mapping_mean_similarity": 0.0,
-        }
-
-    return {
-        "mapping_atom_accuracy": correct_atoms / mappable_atoms,
-        "mapping_exact_match": exact_matches / mapped_reactions if mapped_reactions else 0.0,
-        "mapping_top1": top1_hits / mappable_atoms,
-        "mapping_topk": topk_hits / mappable_atoms,
-        "mapping_assignment_coverage": assigned_atoms / mappable_atoms,
-        "mapping_mean_similarity": score_sum / score_count if score_count else 0.0,
-    }
-
-
-def evaluate_model(
-    model: Model, dataset: ReactionDatasetBase, batch_size: int, mask_seed: int = 0
-) -> dict[str, float]:
-    mlm_metrics = evaluate_mlm_metrics(model, dataset.packed, batch_size=batch_size, mask_seed=mask_seed)
-    mapping_metrics = evaluate_mapping_metrics(model, dataset, batch_size=batch_size)
-    return {**mlm_metrics, **mapping_metrics}
-
-
-def run_training_experiment(
-    model: Model,
-    train_dataset: ReactionDatasetBase,
-    test_dataset: ReactionDatasetBase,
+def run_training(
+    *,
+    dataset: str,
+    train_split: str,
+    test_split: str,
+    train_csv: str | None,
+    test_csv: str | None,
+    data_root: str | None,
     batch_size: int,
     max_epochs: int,
     seed: int,
-    run_name: str = "rxnmap_training",
-    use_aim: bool = False,
-    aim_experiment: str | None = None,
-    accumulate_grad_batches: int = 1,
-    num_workers: int = 4,
-) -> dict[str, float | str]:
+    mode: str,
+    masking_rate: float,
+    learning_rate: float,
+    dropout: float,
+    output_json: str,
+) -> dict[str, Any]:
+    if dataset.lower() == "ringreactions":
+        train_dataset = RingReactionsDataset(
+            split=train_split,
+            csv_path=train_csv or "train_ringreactions.csv",
+            root=data_root,
+        )
+        test_dataset = RingReactionsDataset(
+            split=test_split,
+            csv_path=test_csv or "test_ringreactions.csv",
+            root=data_root,
+        )
+    else:
+        dataset_key = dataset.lower()
+        if dataset_key in {"schneider50k", "uspto50k"}:
+            train_dataset = Schneider50kDataset(split=train_split, root=data_root)
+            test_dataset = Schneider50kDataset(split=test_split, root=data_root)
+        elif dataset_key == "metamdb":
+            train_dataset = MetamdbDataset(split=train_split, root=data_root)
+            test_dataset = MetamdbDataset(split=test_split, root=data_root)
+        elif dataset_key == "golden":
+            train_dataset = GoldenDataset(split=train_split, root=data_root)
+            test_dataset = GoldenDataset(split=test_split, root=data_root)
+        else:
+            raise ValueError(
+                "Unknown dataset. Use ringreactions, schneider50k/uspto50k, metamdb, or golden."
+            )
+
+    print_dataset_stats(train_dataset)
+    print_dataset_stats(test_dataset)
+    if len(train_dataset.packed) == 0:
+        raise RuntimeError("No valid reactions available in the training dataset.")
+
     seed_everything(seed, workers=True)
+    model = build_model(mode, masking_rate, learning_rate, dropout)
     train_loader = model.prepare_dataloader(
         train_dataset.packed,
         batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
-        persistent_workers=num_workers > 0,
+        num_workers=4,
+        pin_memory=False,
+        persistent_workers=False,
     )
 
-    loggers = [CSVLogger("lightning_logs", name=run_name)]
-    if use_aim:
-        try:
-            from aim.pytorch_lightning import AimLogger
-
-            aim_logger = AimLogger(
-                experiment=aim_experiment or run_name,
-                train_metric_prefix="train/",
-                val_metric_prefix="val/",
-                test_metric_prefix="test/",
-            )
-            loggers.append(aim_logger)
-        except Exception as error:
-            print(
-                "Warning: aim logging unavailable "
-                f"({type(error).__name__}: {error}), using CSV logger only"
-            )
-
-    progress_bar = TQDMProgressBar(refresh_rate=10)
-    callbacks = [progress_bar]
-    callbacks.extend(model.configure_callbacks())
-
-    if torch.cuda.is_available():
-        precision = "bf16-mixed" if torch.cuda.is_bf16_supported() else "16-mixed"
-    else:
-        precision = "32"
-
-    accelerator = "cuda" if torch.cuda.is_available() else "cpu"
+    logger = CSVLogger("lightning_logs", name=f"rxnmap_{mode}")
     trainer = Trainer(
-        accelerator=accelerator,
-        devices=1,
-        precision=precision,
         max_epochs=max_epochs,
-        logger=loggers,
+        logger=logger,
+        callbacks=model.configure_callbacks(),
         log_every_n_steps=10,
         num_sanity_val_steps=0,
-        enable_progress_bar=True,
-        callbacks=callbacks,
-        accumulate_grad_batches=accumulate_grad_batches,
     )
 
-    model.train()
     trainer.fit(model, train_dataloaders=train_loader)
-    csv_logger = loggers[0]
-    ckpt_dir = Path(csv_logger.log_dir) / "checkpoints"
-    ckpt_dir.mkdir(parents=True, exist_ok=True)
-    last_checkpoint = ckpt_dir / "last.ckpt"
+
+    log_dir = Path(logger.log_dir)
+    checkpoint_dir = log_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    last_checkpoint = checkpoint_dir / "last.ckpt"
     trainer.save_checkpoint(str(last_checkpoint))
 
-    test_metrics = evaluate_model(model, test_dataset, batch_size=batch_size, mask_seed=seed)
-    return {
-        **test_metrics,
-        "log_dir": csv_logger.log_dir,
-        "last_checkpoint": str(last_checkpoint) if last_checkpoint.exists() else "",
-        "test_metrics_json": write_json(Path(csv_logger.log_dir) / "test_metrics.json", test_metrics),
+    results: dict[str, Any] = {
+        "dataset": dataset,
+        "train_split": train_split,
+        "test_split": test_split,
+        "seed": seed,
+        "batch_size": batch_size,
+        "max_epochs": max_epochs,
+        "mode": mode,
+        "masking_rate": masking_rate,
+        "learning_rate": learning_rate,
+        "dropout": dropout,
+        "log_dir": str(log_dir),
+        "last_checkpoint": str(last_checkpoint),
+        "train_dataset": train_dataset.stats,
+        "test_dataset": test_dataset.stats,
     }
-
-
-def run_scratch_experiment(
-    train_dataset: ReactionDatasetBase,
-    test_dataset: ReactionDatasetBase,
-    batch_size: int,
-    max_epochs: int,
-    seed: int,
-    masking_rate: float,
-    learning_rate: float,
-    dropout: float,
-    run_name: str = "rxnmap_training",
-    use_aim: bool = False,
-    aim_experiment: str | None = None,
-    accumulate_grad_batches: int = 1,
-    num_workers: int = 4,
-) -> dict[str, float | str]:
-    model = build_training_model(masking_rate, learning_rate, dropout)
-    return run_training_experiment(
-        model,
-        train_dataset=train_dataset,
-        test_dataset=test_dataset,
-        batch_size=batch_size,
-        max_epochs=max_epochs,
-        seed=seed,
-        run_name=run_name,
-        use_aim=use_aim,
-        aim_experiment=aim_experiment,
-        accumulate_grad_batches=accumulate_grad_batches,
-        num_workers=num_workers,
-    )
-
-
-def run_finetune_experiment(
-    train_dataset: ReactionDatasetBase,
-    test_dataset: ReactionDatasetBase,
-    batch_size: int,
-    max_epochs: int,
-    seed: int,
-    masking_rate: float,
-    finetune_learning_rate: float,
-    run_name: str = "rxnmap_finetune",
-    use_aim: bool = False,
-    aim_experiment: str | None = None,
-    accumulate_grad_batches: int = 1,
-    num_workers: int = 4,
-) -> dict[str, float | str]:
-    model = build_finetune_model(masking_rate, finetune_learning_rate)
-    return run_training_experiment(
-        model,
-        train_dataset=train_dataset,
-        test_dataset=test_dataset,
-        batch_size=batch_size,
-        max_epochs=max_epochs,
-        seed=seed,
-        run_name=run_name,
-        use_aim=use_aim,
-        aim_experiment=aim_experiment,
-        accumulate_grad_batches=accumulate_grad_batches,
-        num_workers=num_workers,
-    )
-
-
-def print_metrics(label: str, metrics: dict[str, float | str]) -> None:
-    print(f"{label}:")
-    for key in (
-        "mlm_loss_total",
-        "mlm_loss_atom",
-        "mlm_loss_neighbor",
-        "mlm_atom_accuracy",
-        "mlm_neighbor_accuracy",
-        "mlm_perplexity",
-        "mapping_atom_accuracy",
-        "mapping_exact_match",
-        "mapping_top1",
-        "mapping_topk",
-        "mapping_assignment_coverage",
-        "mapping_mean_similarity",
-    ):
-        if key in metrics:
-            print(f"  {key}: {metrics[key]:.6f}")
-    if "last_checkpoint" in metrics:
-        print(f"  last_checkpoint: {metrics['last_checkpoint'] or 'not found'}")
-    if "log_dir" in metrics:
-        print(f"  log_dir: {metrics['log_dir']}")
+    results["summary_json"] = write_json(output_json, results)
+    return results
 
 
 def main(
@@ -450,118 +147,29 @@ def main(
     batch_size: int = 16,
     max_epochs: int = 1,
     seed: int = 42,
+    mode: str = "scratch",
     masking_rate: float = 0.15,
     learning_rate: float = 1e-4,
-    finetune_learning_rate: float = 1e-5,
     dropout: float = 0.1,
-    use_aim: bool = False,
-    aim_experiment: str | None = None,
     output_json: str = "experiment_results/nora_main_summary.json",
 ) -> dict[str, Any]:
-    """
-    Train and evaluate reaction mapping models.
-    """
-    if dataset.lower() == "ringreactions":
-        train_path = train_csv or "train_ringreactions.csv"
-        test_path = test_csv or "test_ringreactions.csv"
-        train_dataset = get_dataset("ringreactions", split=train_split, csv_path=train_path, root=data_root)
-        test_dataset = get_dataset("ringreactions", split=test_split, csv_path=test_path, root=data_root)
-    else:
-        train_dataset = get_dataset(dataset, split=train_split, root=data_root)
-        test_dataset = get_dataset(dataset, split=test_split, root=data_root)
-
-    print_dataset_stats(train_dataset)
-    print_dataset_stats(test_dataset)
-    if len(train_dataset.packed) == 0 or len(test_dataset.packed) == 0:
-        raise RuntimeError("No valid reactions available after parsing train/test datasets.")
-
-    seed_everything(seed, workers=True)
-    baseline_model = Model.pretrained()
-    baseline_metrics = evaluate_model(
-        baseline_model, test_dataset, batch_size=batch_size, mask_seed=seed
-    )
-    print_metrics("pretrained_baseline_on_test", baseline_metrics)
-
-    print(
-        "Training config: "
-        f"epochs={max_epochs}, batch_size={batch_size}, masking_rate={masking_rate}, "
-        f"lr={learning_rate}, finetune_lr={finetune_learning_rate}, "
-        f"dropout={dropout}, use_aim={use_aim}"
-    )
-    scratch_metrics = run_scratch_experiment(
-        train_dataset,
-        test_dataset,
+    """Train the rxnmap model with the same minimal flow shown in the README."""
+    return run_training(
+        dataset=dataset,
+        train_split=train_split,
+        test_split=test_split,
+        train_csv=train_csv,
+        test_csv=test_csv,
+        data_root=data_root,
         batch_size=batch_size,
         max_epochs=max_epochs,
         seed=seed,
+        mode=mode,
         masking_rate=masking_rate,
         learning_rate=learning_rate,
         dropout=dropout,
-        use_aim=use_aim,
-        aim_experiment=aim_experiment,
+        output_json=output_json,
     )
-    print_metrics("scratch_trained_model_on_test", scratch_metrics)
-
-    finetuned_metrics = run_finetune_experiment(
-        train_dataset,
-        test_dataset,
-        batch_size=batch_size,
-        max_epochs=max_epochs,
-        seed=seed,
-        masking_rate=masking_rate,
-        finetune_learning_rate=finetune_learning_rate,
-        use_aim=use_aim,
-        aim_experiment=aim_experiment,
-    )
-    print_metrics("finetuned_pretrained_model_on_test", finetuned_metrics)
-
-    print("=" * 60)
-    print("DELTA (scratch - pretrained)")
-    print("=" * 60)
-    print(
-        f"mlm_loss_total: {scratch_metrics['mlm_loss_total'] - baseline_metrics['mlm_loss_total']:+.6f}"
-    )
-    print(
-        "mapping_atom_accuracy: "
-        f"{scratch_metrics['mapping_atom_accuracy'] - baseline_metrics['mapping_atom_accuracy']:+.6f}"
-    )
-    print(
-        "mapping_exact_match: "
-        f"{scratch_metrics['mapping_exact_match'] - baseline_metrics['mapping_exact_match']:+.6f}"
-    )
-
-    print("=" * 60)
-    print("DELTA (finetuned - pretrained)")
-    print("=" * 60)
-    print(
-        f"mlm_loss_total: {finetuned_metrics['mlm_loss_total'] - baseline_metrics['mlm_loss_total']:+.6f}"
-    )
-    print(
-        "mapping_atom_accuracy: "
-        f"{finetuned_metrics['mapping_atom_accuracy'] - baseline_metrics['mapping_atom_accuracy']:+.6f}"
-    )
-    print(
-        "mapping_exact_match: "
-        f"{finetuned_metrics['mapping_exact_match'] - baseline_metrics['mapping_exact_match']:+.6f}"
-    )
-
-    results = {
-        "dataset": dataset,
-        "train_split": train_split,
-        "test_split": test_split,
-        "seed": seed,
-        "batch_size": batch_size,
-        "max_epochs": max_epochs,
-        "masking_rate": masking_rate,
-        "learning_rate": learning_rate,
-        "finetune_learning_rate": finetune_learning_rate,
-        "dropout": dropout,
-        "baseline_test": baseline_metrics,
-        "scratch_test": scratch_metrics,
-        "finetune_test": finetuned_metrics,
-    }
-    results["summary_json"] = write_json(output_json, results)
-    return results
 
 
 if __name__ == "__main__":
