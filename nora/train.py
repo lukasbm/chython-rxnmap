@@ -33,11 +33,11 @@ def build_model(mode: str, masking_rate: float, learning_rate: float, dropout: f
         "optimizer": partial(AdamW, lr=learning_rate),
         "dropout": dropout,
     }
-    if mode == "pretrained":
+    if mode in {"pretrained", "fine_tuned", "finetuned"}:
         return Model.pretrained(**model_kwargs)
     if mode == "scratch":
         return Model(**model_kwargs)
-    raise ValueError("mode must be 'scratch' or 'pretrained'")
+    raise ValueError("mode must be 'scratch', 'pretrained', or 'fine_tuned'")
 
 
 def run_training(
@@ -56,6 +56,7 @@ def run_training(
     learning_rate: float,
     dropout: float,
     output_json: str,
+    checkpoint_dir: str | None,
 ) -> dict[str, Any]:
     if dataset.lower() == "ringreactions":
         train_dataset = RingReactionsDataset(
@@ -100,7 +101,7 @@ def run_training(
         persistent_workers=False,
     )
 
-    logger = CSVLogger("lightning_logs", name=f"rxnmap_{mode}")
+    logger = CSVLogger("lightning_logs", name=f"rxnmap_{dataset}_{mode}")
     trainer = Trainer(
         max_epochs=max_epochs,
         logger=logger,
@@ -112,9 +113,9 @@ def run_training(
     trainer.fit(model, train_dataloaders=train_loader)
 
     log_dir = Path(logger.log_dir)
-    checkpoint_dir = log_dir / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    last_checkpoint = checkpoint_dir / "last.ckpt"
+    output_checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir else log_dir / "checkpoints"
+    output_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    last_checkpoint = output_checkpoint_dir / f"{dataset}_{mode}_seed{seed}_last.ckpt"
     trainer.save_checkpoint(str(last_checkpoint))
 
     results: dict[str, Any] = {
@@ -130,6 +131,7 @@ def run_training(
         "dropout": dropout,
         "log_dir": str(log_dir),
         "last_checkpoint": str(last_checkpoint),
+        "checkpoint_dir": str(output_checkpoint_dir),
         "train_dataset": train_dataset.stats,
         "test_dataset": test_dataset.stats,
     }
@@ -143,7 +145,7 @@ def main(
     test_split: str = "test",
     train_csv: str | None = None,
     test_csv: str | None = None,
-    data_root: str | None = None,
+    data_root: str | None = "data/data",
     batch_size: int = 16,
     max_epochs: int = 1,
     seed: int = 42,
@@ -152,6 +154,7 @@ def main(
     learning_rate: float = 1e-4,
     dropout: float = 0.1,
     output_json: str = "experiment_results/nora_main_summary.json",
+    checkpoint_dir: str | None = "experiment_results/checkpoints",
 ) -> dict[str, Any]:
     """Train the rxnmap model with the same minimal flow shown in the README."""
     return run_training(
@@ -169,6 +172,7 @@ def main(
         learning_rate=learning_rate,
         dropout=dropout,
         output_json=output_json,
+        checkpoint_dir=checkpoint_dir,
     )
 
 

@@ -1,0 +1,653 @@
+chytorch/zoo/rxnmap/__init__.py --- 1/3 --- Python
+ 17 #  along with this program; if not, see <https:  17 #  along with this program; if not, see <https:
+ .. //www.gnu.org/licenses/>.                        .. //www.gnu.org/licenses/>.
+ 18 #                                                18 #
+ 19 from functools import partial                    19 from functools import partial
+ 20 from pkg_resources import resource_stream        20 from importlib.resources import files
+ ..                                                  21 from math import cos, pi
+ ..                                                  22 from typing import Callable, Iterator
+ ..                                                  23 
+ ..                                                  24 from chytorch.nn import ReactionEncoder
+ ..                                                  25 from chytorch.utils.data import ReactionDataset
+ ..                                                  .. , collate_reactions
+ 21 from pytorch_lightning import LightningModule    26 from pytorch_lightning import LightningModule
+ 22 from pytorch_lightning.callbacks import ModelCh  27 from pytorch_lightning.callbacks import Learnin
+ .. eckpoint, LearningRateMonitor                    .. gRateMonitor, ModelCheckpoint
+ 23 from torch import rand                           28 from torch import rand
+ 24 from torch.nn import LazyLinear, Parameter       29 from torch.nn import LazyLinear, Parameter
+ 25 from torch.nn.functional import cross_entropy    30 from torch.nn.functional import cross_entropy
+ 26 from torch.optim import AdamW, Optimizer         31 from torch.optim import AdamW, Optimizer
+ 27 from torch.optim.lr_scheduler import _LRSchedul  32 from torch.optim.lr_scheduler import _LRSchedul
+ .. er                                               .. er
+ 28 from torch.utils.data import DataLoader          33 from torch.utils.data import DataLoader
+ 29 from typing import Callable, Iterator            34 
+ 30 from ...nn import ReactionEncoder                35 
+ ..                                                  36 class WarmUpCosine(_LRScheduler):
+ ..                                                  37     """Learning rate scheduler with warmup foll
+ ..                                                  .. owed by cosine annealing."""
+ ..                                                  38 
+ ..                                                  39     def __init__(
+ ..                                                  40             self,
+ ..                                                  41             optimizer: Optimizer,
+ ..                                                  42             warmup: int = 10000,
+ ..                                                  43             period: int = 500000,
+ ..                                                  44             decrease_coef: float = 0.01,
+ ..                                                  45             last_epoch: int = -1,
+ ..                                                  46     ):
+ 31 from ...optim.lr_scheduler import WarmUpCosine   47         self.warmup = warmup
+ ..                                                  48         self.period = period
+ ..                                                  49         self.decrease_coef = decrease_coef
+ ..                                                  50         super().__init__(optimizer, last_epoch)
+ ..                                                  51 
+ ..                                                  52     def get_lr(self):
+ ..                                                  53         current_step = self.last_epoch
+ ..                                                  54         if current_step < self.warmup:
+ ..                                                  55             # Linear warmup
+ 32 from ...utils.data import ReactionDataset, coll  56             return [base_lr * (current_step / s
+ .. ate_reactions                                    .. elf.warmup) for base_lr in self.base_lrs]
+ ..                                                  57         else:
+ ..                                                  58             # Cosine annealing
+ ..                                                  59             progress = (current_step - self.war
+ ..                                                  .. mup) / (self.period - self.warmup)
+ ..                                                  60             progress = min(progress, 1.0)
+ ..                                                  61             return [
+ ..                                                  62                 base_lr
+ ..                                                  63                 * (
+ ..                                                  64                         self.decrease_coef
+ ..                                                  65                         + (1 - self.decrease_co
+ ..                                                  .. ef) * (1 + cos(pi * progress)) / 2
+ ..                                                  66                 )
+ ..                                                  67                 for base_lr in self.base_lrs
+ ..                                                  68             ]
+ 33                                                  69 
+ 34                                                  70 
+ 35 class Model(LightningModule):                    71 class Model(LightningModule):
+ 36     def __init__(self, *, masking_rate=.15,      72     def __init__(
+ ..                                                  73             self,
+ ..                                                  74             *,
+ ..                                                  75             masking_rate=0.15,
+ 37                  lr_scheduler: Callable[[Optimi  76             lr_scheduler: Callable[[Optimizer],
+ .. zer], _LRScheduler] = None,                      ..  _LRScheduler] = None,
+ 38                  optimizer: Callable[[Iterator[  77             optimizer: Callable[[Iterator[Param
+ .. Parameter]], Optimizer] = None, **kwargs):       .. eter]], Optimizer] = None,
+ ..                                                  78             **kwargs,
+ ..                                                  79     ):
+ 39         super().__init__()                       80         super().__init__()
+ 40         self.encoder = ReactionEncoder(**kwargs  81         self.encoder = ReactionEncoder(**kwargs
+ .. )                                                .. )
+ 41         self.mlma = LazyLinear(118)              82         self.mlma = LazyLinear(118)
+ 42         self.mlmn = LazyLinear(self.encoder.mol  83         self.mlmn = LazyLinear(
+ .. ecule_encoder.centrality_encoder.num_embeddings  .. 
+ ..  - 2)                                            .. 
+ ..                                                  84             self.encoder.molecule_encoder.centr
+ ..                                                  .. ality_encoder.num_embeddings - 2
+ ..                                                  85         )
+ 43                                                  86 
+ 44         if lr_scheduler is None:                 87         if lr_scheduler is None:
+ 45             lr_scheduler = partial(WarmUpCosine  88             lr_scheduler = partial(
+ .. , decrease_coef=.01, warmup=int(1e4), period=in  .. 
+ .. t(5e5))                                          .. 
+ ..                                                  89                 WarmUpCosine, decrease_coef=0.0
+ ..                                                  .. 1, warmup=int(1e4), period=int(5e5)
+ ..                                                  90             )
+ 46         if optimizer is None:                    91         if optimizer is None:
+ 47             optimizer = partial(AdamW, lr=1e-4)  92             optimizer = partial(AdamW, lr=1e-4)
+
+chytorch/zoo/rxnmap/__init__.py --- 2/3 --- Python
+ 53                                                  98 
+ 54     @classmethod                                 99     @classmethod
+ 55     def pretrained(cls, **kwargs):              100     def pretrained(cls, **kwargs):
+ ..                                                 101         weights_path = files(__package__).joinp
+ ..                                                 ... ath("weights.pt")
+ 56         model = cls.load_from_checkpoint(resour 102         model = cls.load_from_checkpoint(
+ .. ce_stream(__package__, 'weights.pt'), map_locat ... 
+ .. ion='cpu', **kwargs)                            ... 
+ ..                                                 103             str(weights_path), map_location="cp
+ ..                                                 ... u", **kwargs
+ ..                                                 104         )
+ 57         model.eval()                            105         model.eval()
+ 58         return model                            106         return model
+
+chytorch/zoo/rxnmap/__init__.py --- 3/3 --- Python
+ 83                                                 133 
+ 84         l1 = cross_entropy(atoms, a[m].long() - 134         l1 = cross_entropy(atoms, a[m].long() -
+ ..  3)                                             ...  3)
+ 85         l2 = cross_entropy(neighbors, n[m].long 135         l2 = cross_entropy(neighbors, n[m].long
+ .. () - 2)                                         ... () - 2)
+ 86         self.log('trn_loss_mlm_a', l1.item(), s 136         self.log("trn_loss_mlm_a", l1.item(), s
+ .. ync_dist=True)                                  ... ync_dist=True)
+ 87         self.log('trn_loss_mlm_n', l2.item(), s 137         self.log("trn_loss_mlm_n", l2.item(), s
+ .. ync_dist=True)                                  ... ync_dist=True)
+ 88         self.log('trn_loss_tot', l1.item() + l2 138         self.log("trn_loss_tot", l1.item() + l2
+ .. .item(), sync_dist=True)                        ... .item(), sync_dist=True)
+ 89         return l1 + l2                          139         return l1 + l2
+ 90                                                 140 
+ 91     def configure_callbacks(self):              141     def configure_callbacks(self):
+ 92         return [ModelCheckpoint(save_weights_on 142         return [
+ .. ly=True, save_last=True, every_n_train_steps=10 ... 
+ .. 000),                                           ... 
+ ..                                                 143             ModelCheckpoint(
+ ..                                                 144                 save_weights_only=True, save_la
+ ..                                                 ... st=True, every_n_train_steps=10000
+ ..                                                 145             ),
+ 93                 LearningRateMonitor(logging_int 146             LearningRateMonitor(logging_interva
+ .. erval='step')]                                  ... l="step"),
+ ..                                                 147         ]
+ 94                                                 148 
+ 95     def configure_optimizers(self):             149     def configure_optimizers(self):
+ 96         o = self.optimizer(self.parameters())   150         o = self.optimizer(self.parameters())
+ 97         s = self.lr_scheduler(o)                151         s = self.lr_scheduler(o)
+ 98         return [o], [{'scheduler': s, 'interval 152         return [o], [{"scheduler": s, "interval
+ .. ': 'step', 'name': 'lr_scheduler'}]             ... ": "step", "name": "lr_scheduler"}]
+ 99                                                 153 
+100                                                 154 
+101 __all__ = ['Model']                             155 __all__ = ["Model"]
+
+nora/datasets.py --- Python
+  1 from __future__ import annotations
+  2 
+  3 import csv
+  4 from pathlib import Path
+  5 from typing import Any, Iterable
+  6 
+  7 from chython import smiles
+  8 
+  9 
+ 10 def _resolve_path(*, root: str | Path | None, path: str | Path) -> Path:
+ 11     candidate = Path(path)
+ 12     if candidate.is_absolute() or root is None:
+ 13         return candidate
+ 14     return Path(root) / candidate
+ 15 
+ 16 
+ 17 def _read_lines(path: Path) -> list[str]:
+ 18     with path.open("r") as handle:
+ 19         return [line.strip() for line in handle if line.strip()]
+ 20 
+ 21 
+ 22 def _read_csv_column(
+ 23     path: Path,
+ 24     *,
+ 25     delimiter: str = ",",
+ 26     column_index: int = 0,
+ 27 ) -> list[str]:
+ 28     with path.open("r", newline="") as handle:
+ 29         rows = []
+ 30         for row in csv.reader(handle, delimiter=delimiter):
+ 31             if not row or len(row) <= column_index:
+ 32                 continue
+ 33             value = row[column_index].strip()
+ 34             if value:
+ 35                 rows.append(value)
+ 36         return rows
+ 37 
+ 38 
+ 39 def _read_tsv_column(path: Path, column: str) -> list[str]:
+ 40     with path.open("r", newline="") as handle:
+ 41         reader = csv.DictReader(handle, delimiter="\t")
+ 42         rows = []
+ 43         for row in reader:
+ 44             value = row.get(column, "").strip()
+ 45             if value:
+ 46                 rows.append(value)
+ 47         return rows
+ 48 
+ 49 
+ 50 def _split_rows(
+ 51     rows: list[str],
+ 52     *,
+ 53     split: str,
+ 54     train_ratio: float = 0.8,
+ 55     val_ratio: float = 0.1,
+ 56 ) -> list[str]:
+ 57     if split not in {"train", "val", "test"}:
+ 58         raise ValueError(f"split must be 'train', 'val', or 'test', got '{split}'")
+ 59     if not rows:
+ 60         return []
+ 61     train_end = int(len(rows) * train_ratio)
+ 62     val_end = int(len(rows) * (train_ratio + val_ratio))
+ 63     if split == "train":
+ 64         return rows[:train_end]
+ 65     if split == "val":
+ 66         return rows[train_end:val_end]
+ 67     return rows[val_end:]
+ 68 
+ 69 
+ 70 def _parse_reactions(rows: Iterable[str], source: Path) -> tuple[list[Any], list[bytes], int, int]:
+ 71     reactions: list[Any] = []
+ 72     packed: list[bytes] = []
+ 73     total = 0
+ 74     failed = 0
+ 75     warning_count = 0
+ 76 
+ 77     for row in rows:
+ 78         reaction_smiles = row.strip()
+ 79         if not reaction_smiles:
+ 80             continue
+ 81         total += 1
+ 82         try:
+ 83             reaction = smiles(reaction_smiles)
+ 84             reaction.canonicalize()
+ 85             reactions.append(reaction)
+ 86             packed.append(reaction.pack())
+ 87         except Exception as exc:
+ 88             failed += 1
+ 89             if warning_count < 10:
+ 90                 print(f"Warning: failed to parse reaction #{total} from {source}: {exc}")
+ 91                 warning_count += 1
+ 92 
+ 93     return reactions, packed, total, failed
+ 94 
+ 95 
+ 96 class ReactionDatasetBase:
+ 97     def __init__(self, dataset_name: str, source: Path, split: str, rows: Iterable[str]):
+ 98         self.dataset_name = dataset_name
+ 99         self.source = source
+100         self.split = split
+101         self._reactions: list[Any] = []
+102         self._packed: list[bytes] = []
+103         self._total = 0
+104         self._failed = 0
+105         self._reactions, self._packed, self._total, self._failed = _parse_reactions(rows, source)
+106 
+107     @property
+108     def reactions(self) -> list[Any]:
+109         return self._reactions
+110 
+111     @property
+112     def packed(self) -> list[bytes]:
+113         return self._packed
+114 
+115     @property
+116     def stats(self) -> dict[str, Any]:
+117         return {
+118             "total": self._total,
+119             "valid": len(self._packed),
+120             "failed": self._failed,
+121             "split": self.split,
+122             "source": str(self.source),
+123         }
+124 
+125     def __len__(self) -> int:
+126         return len(self._packed)
+127 
+128     def __repr__(self) -> str:
+129         return (
+130             f"{self.__class__.__name__}('{self.dataset_name}', "
+131             f"split='{self.split}', total={self._total}, valid={len(self._packed)}, failed={self._failed})"
+132         )
+133 
+134 
+135 class GoldenDataset(ReactionDatasetBase):
+136     DEFAULT_SMILES_PATH = Path("golden.smiles")
+137 
+138     def __init__(
+139         self,
+140         *,
+141         split: str = "train",
+142         smiles_path: str | Path | None = None,
+143         root: str | Path | None = None,
+144     ):
+145         if split not in {"train", "val", "test"}:
+146             raise ValueError(f"golden split must be 'train', 'val', or 'test', got '{split}'")
+147         resolved_path = _resolve_path(root=root, path=smiles_path or self.DEFAULT_SMILES_PATH)
+148         if not resolved_path.exists():
+149             raise FileNotFoundError(f"Golden file not found: {resolved_path}")
+150         rows = _split_rows(_read_lines(resolved_path), split=split)
+151         super().__init__(dataset_name="golden", source=resolved_path, split=split, rows=rows)
+152 
+153 
+154 class Schneider50kDataset(ReactionDatasetBase):
+155     DEFAULT_TSV_PATH = Path("schneider50k.tsv")
+156     COLUMN = "clean_rxn"
+157 
+158     def __init__(
+159         self,
+160         *,
+161         split: str = "train",
+162         tsv_path: str | Path | None = None,
+163         root: str | Path | None = None,
+164     ):
+165         if split not in {"train", "val", "test"}:
+166             raise ValueError(f"schneider50k split must be 'train', 'val', or 'test', got '{split}'")
+167         resolved_path = _resolve_path(root=root, path=tsv_path or self.DEFAULT_TSV_PATH)
+168         if not resolved_path.exists():
+169             raise FileNotFoundError(f"Schneider file not found: {resolved_path}")
+170         rows = _split_rows(_read_tsv_column(resolved_path, self.COLUMN), split=split)
+171         super().__init__(dataset_name="schneider50k", source=resolved_path, split=split, rows=rows)
+172 
+173 
+174 class RingReactionsDataset(ReactionDatasetBase):
+175     TRAIN_PATH = Path("train_ringreactions.csv")
+176     TEST_PATH = Path("test_ringreactions.csv")
+177 
+178     def __init__(
+179         self,
+180         *,
+181         split: str = "train",
+182         csv_path: str | Path | None = None,
+183         root: str | Path | None = None,
+184     ):
+185         if split not in {"train", "val", "test"}:
+186             raise ValueError(f"ringreactions split must be 'train', 'val', or 'test', got '{split}'")
+187         if split == "test":
+188             resolved_path = _resolve_path(root=root, path=csv_path or self.TEST_PATH)
+189             if not resolved_path.exists():
+190                 raise FileNotFoundError(f"Ring reactions file not found: {resolved_path}")
+191             rows = _read_csv_column(resolved_path)
+192         else:
+193             resolved_path = _resolve_path(root=root, path=csv_path or self.TRAIN_PATH)
+194             if not resolved_path.exists():
+195                 raise FileNotFoundError(f"Ring reactions file not found: {resolved_path}")
+196             rows = _split_rows(_read_csv_column(resolved_path), split=split, train_ratio=0.9, val_ratio=0.1)
+197         super().__init__(dataset_name="ringreactions", source=resolved_path, split=split, rows=rows)
+198 
+199 
+200 class MetamdbDataset(ReactionDatasetBase):
+201     TRAIN_PATH = Path("train_metamdb_filtered.csv")
+202     TEST_PATH = Path("test_metamdb_filtered.csv")
+203     DELIMITER = ";"
+204 
+205     def __init__(
+206         self,
+207         *,
+208         split: str = "train",
+209         csv_path: str | Path | None = None,
+210         root: str | Path | None = None,
+211     ):
+212         if split not in {"train", "val", "test"}:
+213             raise ValueError(f"metamdb split must be 'train', 'val', or 'test', got '{split}'")
+214         if split == "test":
+215             resolved_path = _resolve_path(root=root, path=csv_path or self.TEST_PATH)
+216             if not resolved_path.exists():
+217                 raise FileNotFoundError(f"MetaDB file not found: {resolved_path}")
+218             rows = _read_csv_column(resolved_path, delimiter=self.DELIMITER, column_index=1)
+219         else:
+220             resolved_path = _resolve_path(root=root, path=csv_path or self.TRAIN_PATH)
+221             if not resolved_path.exists():
+222                 raise FileNotFoundError(f"MetaDB file not found: {resolved_path}")
+223             rows = _split_rows(
+224                 _read_csv_column(resolved_path, delimiter=self.DELIMITER, column_index=1),
+225                 split=split,
+226                 train_ratio=0.9,
+227                 val_ratio=0.1,
+228             )
+229         super().__init__(dataset_name="metamdb", source=resolved_path, split=split, rows=rows)
+230 
+231 
+232 def print_dataset_stats(dataset: ReactionDatasetBase) -> None:
+233     stats = dataset.stats
+234     print(f"{dataset}: {', '.join(f'{key}={value}' for key, value in stats.items())}")
+235  
+236 
+237 class CombinedReactionDataset:
+238     """Combines multiple datasets into one in-memory dataset."""
+239 
+240     def __init__(self, *datasets: ReactionDatasetBase, name: str | None = None):
+241         self.dataset_name = name or "+".join(dataset.dataset_name for dataset in datasets)
+242         self.split = "combined"
+243         self._reactions: list[Any] = [reaction for dataset in datasets for reaction in dataset.reactions]
+244         self._packed: list[bytes] = [packed for dataset in datasets for packed in dataset.packed]
+245         self._total: int = sum(dataset._total for dataset in datasets)
+246         self._failed: int = sum(dataset._failed for dataset in datasets)
+247 
+248     @property
+249     def reactions(self) -> list[Any]:
+250         return self._reactions
+251 
+252     @property
+253     def packed(self) -> list[bytes]:
+254         return self._packed
+255 
+256     @property
+257     def stats(self) -> dict[str, Any]:
+258         return {
+259             "total": self._total,
+260             "valid": len(self._packed),
+261             "failed": self._failed,
+262             "split": self.split,
+263         }
+264 
+265     def __len__(self) -> int:
+266         return len(self._packed)
+267 
+268     def __repr__(self) -> str:
+269         return (
+270             f"CombinedReactionDataset('{self.dataset_name}', "
+271             f"n={len(self._packed)}, total={self._total}, failed={self._failed})"
+272         )
+273 
+
+nora/train.py --- Python
+  1 from __future__ import annotations
+  2 
+  3 import json
+  4 from functools import partial
+  5 from pathlib import Path
+  6 from typing import Any
+  7 
+  8 import fire
+  9 from pytorch_lightning import Trainer, seed_everything
+ 10 from pytorch_lightning.loggers import CSVLogger
+ 11 from torch.optim import AdamW
+ 12 
+ 13 from chytorch.zoo.rxnmap import Model
+ 14 from nora.datasets import (
+ 15     GoldenDataset,
+ 16     MetamdbDataset,
+ 17     RingReactionsDataset,
+ 18     Schneider50kDataset,
+ 19     print_dataset_stats,
+ 20 )
+ 21 
+ 22 
+ 23 def write_json(path: Path | str, payload: dict[str, Any]) -> str:
+ 24     output = Path(path)
+ 25     output.parent.mkdir(parents=True, exist_ok=True)
+ 26     output.write_text(json.dumps(payload, indent=2, sort_keys=True))
+ 27     return str(output)
+ 28 
+ 29 
+ 30 def build_model(mode: str, masking_rate: float, learning_rate: float, dropout: float) -> Model:
+ 31     model_kwargs = {
+ 32         "masking_rate": masking_rate,
+ 33         "optimizer": partial(AdamW, lr=learning_rate),
+ 34         "dropout": dropout,
+ 35     }
+ 36     if mode == "pretrained":
+ 37         return Model.pretrained(**model_kwargs)
+ 38     if mode == "scratch":
+ 39         return Model(**model_kwargs)
+ 40     raise ValueError("mode must be 'scratch' or 'pretrained'")
+ 41 
+ 42 
+ 43 def run_training(
+ 44     *,
+ 45     dataset: str,
+ 46     train_split: str,
+ 47     test_split: str,
+ 48     train_csv: str | None,
+ 49     test_csv: str | None,
+ 50     data_root: str | None,
+ 51     batch_size: int,
+ 52     max_epochs: int,
+ 53     seed: int,
+ 54     mode: str,
+ 55     masking_rate: float,
+ 56     learning_rate: float,
+ 57     dropout: float,
+ 58     output_json: str,
+ 59 ) -> dict[str, Any]:
+ 60     if dataset.lower() == "ringreactions":
+ 61         train_dataset = RingReactionsDataset(
+ 62             split=train_split,
+ 63             csv_path=train_csv or "train_ringreactions.csv",
+ 64             root=data_root,
+ 65         )
+ 66         test_dataset = RingReactionsDataset(
+ 67             split=test_split,
+ 68             csv_path=test_csv or "test_ringreactions.csv",
+ 69             root=data_root,
+ 70         )
+ 71     else:
+ 72         dataset_key = dataset.lower()
+ 73         if dataset_key in {"schneider50k", "uspto50k"}:
+ 74             train_dataset = Schneider50kDataset(split=train_split, root=data_root)
+ 75             test_dataset = Schneider50kDataset(split=test_split, root=data_root)
+ 76         elif dataset_key == "metamdb":
+ 77             train_dataset = MetamdbDataset(split=train_split, root=data_root)
+ 78             test_dataset = MetamdbDataset(split=test_split, root=data_root)
+ 79         elif dataset_key == "golden":
+ 80             train_dataset = GoldenDataset(split=train_split, root=data_root)
+ 81             test_dataset = GoldenDataset(split=test_split, root=data_root)
+ 82         else:
+ 83             raise ValueError(
+ 84                 "Unknown dataset. Use ringreactions, schneider50k/uspto50k, metamdb, or golden."
+ 85             )
+ 86 
+ 87     print_dataset_stats(train_dataset)
+ 88     print_dataset_stats(test_dataset)
+ 89     if len(train_dataset.packed) == 0:
+ 90         raise RuntimeError("No valid reactions available in the training dataset.")
+ 91 
+ 92     seed_everything(seed, workers=True)
+ 93     model = build_model(mode, masking_rate, learning_rate, dropout)
+ 94     train_loader = model.prepare_dataloader(
+ 95         train_dataset.packed,
+ 96         batch_size=batch_size,
+ 97         shuffle=True,
+ 98         num_workers=4,
+ 99         pin_memory=False,
+100         persistent_workers=False,
+101     )
+102 
+103     logger = CSVLogger("lightning_logs", name=f"rxnmap_{mode}")
+104     trainer = Trainer(
+105         max_epochs=max_epochs,
+106         logger=logger,
+107         callbacks=model.configure_callbacks(),
+108         log_every_n_steps=10,
+109         num_sanity_val_steps=0,
+110     )
+111 
+112     trainer.fit(model, train_dataloaders=train_loader)
+113 
+114     log_dir = Path(logger.log_dir)
+115     checkpoint_dir = log_dir / "checkpoints"
+116     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+117     last_checkpoint = checkpoint_dir / "last.ckpt"
+118     trainer.save_checkpoint(str(last_checkpoint))
+119 
+120     results: dict[str, Any] = {
+121         "dataset": dataset,
+122         "train_split": train_split,
+123         "test_split": test_split,
+124         "seed": seed,
+125         "batch_size": batch_size,
+126         "max_epochs": max_epochs,
+127         "mode": mode,
+128         "masking_rate": masking_rate,
+129         "learning_rate": learning_rate,
+130         "dropout": dropout,
+131         "log_dir": str(log_dir),
+132         "last_checkpoint": str(last_checkpoint),
+133         "train_dataset": train_dataset.stats,
+134         "test_dataset": test_dataset.stats,
+135     }
+136     results["summary_json"] = write_json(output_json, results)
+137     return results
+138 
+139 
+140 def main(
+141     dataset: str = "ringreactions",
+142     train_split: str = "train",
+143     test_split: str = "test",
+144     train_csv: str | None = None,
+145     test_csv: str | None = None,
+146     data_root: str | None = None,
+147     batch_size: int = 16,
+148     max_epochs: int = 1,
+149     seed: int = 42,
+150     mode: str = "scratch",
+151     masking_rate: float = 0.15,
+152     learning_rate: float = 1e-4,
+153     dropout: float = 0.1,
+154     output_json: str = "experiment_results/nora_main_summary.json",
+155 ) -> dict[str, Any]:
+156     """Train the rxnmap model with the same minimal flow shown in the README."""
+157     return run_training(
+158         dataset=dataset,
+159         train_split=train_split,
+160         test_split=test_split,
+161         train_csv=train_csv,
+162         test_csv=test_csv,
+163         data_root=data_root,
+164         batch_size=batch_size,
+165         max_epochs=max_epochs,
+166         seed=seed,
+167         mode=mode,
+168         masking_rate=masking_rate,
+169         learning_rate=learning_rate,
+170         dropout=dropout,
+171         output_json=output_json,
+172     )
+173 
+174 
+175 if __name__ == "__main__":
+176     fire.Fire(main)
+177 
+
+setup.py --- Python
+ 1 #!/usr/bin/env python3
+ 2 # -*- coding: utf-8 -*-
+ 3 #
+ 4 #  Copyright 2022 Ramil Nugmanov <nougmanoff@protonmail.com>
+ 5 #  This file is part of chytorch.
+ 6 #
+ 7 #  chytorch is free software; you can redistribute it and/or modify
+ 8 #  it under the terms of the GNU Lesser General Public License as published by
+ 9 #  the Free Software Foundation; either version 3 of the License, or
+10 #  (at your option) any later version.
+11 #
+12 #  This program is distributed in the hope that it will be useful,
+13 #  but WITHOUT ANY WARRANTY; without even the implied warranty of
+14 #  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+15 #  GNU Lesser General Public License for more details.
+16 #
+17 #  You should have received a copy of the GNU Lesser General Public License
+18 #  along with this program; if not, see <https://www.gnu.org/licenses/>.
+19 #
+20 from pathlib import Path
+21 from setuptools import setup, find_namespace_packages
+22 
+23 
+24 setup(
+25     name='chytorch-rxnmap',
+26     version='1.3',
+27     packages=find_namespace_packages(include=('chytorch.*',)),
+28     url='https://github.com/chython/chytorch-rxnmap',
+29     license='LGPLv3',
+30     author='Dr. Ramil Nugmanov',
+31     author_email='nougmanoff@protonmail.com',
+32     python_requires='>=3.8',
+33     install_requires=['pytorch-lightning>=1.5.6', 'chytorch>=1.13,<2.0'],
+34     zip_safe=False,
+35     long_description=(Path(__file__).parent / 'README.md').read_text('utf8'),
+36     long_description_content_type='text/markdown',
+37     package_data={'chytorch.zoo.rxnmap': ['weights.pt']},
+38     classifiers=['Environment :: Plugins',
+39                  'Intended Audience :: Science/Research',
+40                  'License :: OSI Approved :: GNU Lesser General Public License v3 or later (LGPLv3+)',
+41                  'Operating System :: OS Independent',
+42                  'Programming Language :: Python',
+43                  'Programming Language :: Python :: 3 :: Only',
+44                  'Programming Language :: Python :: 3.8',
+45                  'Topic :: Scientific/Engineering',
+46                  'Topic :: Scientific/Engineering :: Chemistry',
+47                  'Topic :: Scientific/Engineering :: Information Analysis',
+48                  'Topic :: Software Development',
+49                  'Topic :: Software Development :: Libraries',
+50                  'Topic :: Software Development :: Libraries :: Python Modules']
+51 )
+52 
+

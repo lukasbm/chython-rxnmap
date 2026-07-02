@@ -18,14 +18,14 @@
 #
 from functools import partial
 from importlib.resources import files
-from math import cos, pi
+from math import cos, inf, pi
 from typing import Callable, Iterator
 
 from chytorch.nn import ReactionEncoder
 from chytorch.utils.data import ReactionDataset, collate_reactions
 from pytorch_lightning import LightningModule
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
-from torch import rand
+from torch import float as t_float, rand, zeros_like
 from torch.nn import LazyLinear, Parameter
 from torch.nn.functional import cross_entropy
 from torch.optim import AdamW, Optimizer
@@ -117,9 +117,28 @@ class Model(LightningModule):
         return DataLoader(ds, collate_fn=collate_reactions, **kwargs)
 
     def forward(self, batch, *, mapping_task=False):
+        if not isinstance(batch, tuple):
+            loader = self.prepare_dataloader([batch.pack()], batch_size=1, shuffle=False)
+            batch = next(iter(loader))
+            batch = tuple(tensor.to(self.device) for tensor in batch)
+            return self._attention_weights(batch).squeeze(0)
         if mapping_task:
-            return self.encoder(batch, need_embedding=False, need_weights=True)
+            return self._attention_weights(batch)
         return self.encoder(batch)
+
+    def _attention_weights(self, batch):
+        atoms, neighbors, distances, roles = batch
+        n = atoms.size(1)
+        d_mask = zeros_like(roles, dtype=t_float).masked_fill_(roles == 0, -inf).view(-1, 1, 1, n)
+        d_mask = d_mask.expand(-1, self.encoder.nhead, n, -1)
+
+        x = self.encoder.molecule_encoder((atoms, neighbors, distances)) * (roles > 1).unsqueeze(-1)
+        x = x + self.encoder.role_encoder(roles)
+
+        weights = None
+        for layer in self.encoder.layers:
+            x, weights = layer(x, d_mask, need_weights=True)
+        return weights
 
     def training_step(self, batch, batch_idx):
         a, n, d, r = batch
